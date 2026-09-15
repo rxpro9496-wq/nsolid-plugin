@@ -2,6 +2,7 @@
 
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -37,6 +38,23 @@ const serverA: McpServerRef = {
   name: 'ns-benchmark',
   url: 'https://benchmark.mcp.saas.nodesource.io/mcp',
   headers: { 'X-Nsolid-Service-Token': '${AUTH_TOKEN}', 'X-Nsolid-Org-Id': '${AUTH_ORG_ID}' },
+}
+
+// The native Codex CLI is the contract for the header key name, but it is an
+// optional local dependency: probe it once and skip the parser test when absent.
+const codexVersionProbe = spawnSync('codex', ['--version'], { encoding: 'utf-8', timeout: 10000 })
+const codexCliAvailable = codexVersionProbe.status === 0 && /codex/i.test(codexVersionProbe.stdout ?? '')
+
+function readNativeCodexTransport (name: string): Record<string, unknown> {
+  const result = spawnSync('codex', ['mcp', 'get', name, '--json'], {
+    encoding: 'utf-8',
+    timeout: 30000,
+    // Isolated CODEX_HOME under the test HOME: reads only the dummy config,
+    // no user config and no service calls.
+    env: { ...process.env, HOME: tmpDir, CODEX_HOME: join(tmpDir, '.codex') },
+  })
+  assert.strictEqual(result.status, 0, `codex mcp get ${name} failed: ${result.stderr}`)
+  return (JSON.parse(result.stdout) as { transport: Record<string, unknown> }).transport
 }
 
 describe('writeMcpConfig', () => {
@@ -315,6 +333,256 @@ describe('writeMcpConfig', () => {
     assert.strictEqual(parsed.version, '1.0')
     assert.strictEqual(parsed.theme, 'dark')
     assert.ok('ns-benchmark' in parsed.mcp)
+  })
+  it('serializes recognized Codex http_headers for all three MCPs incl benchmark Org ID', async () => {
+    const { writeMcpConfig } = await import('../../../src/mcp/mcp-config-writer.js')
+    const { resolveHome } = await import('../../../src/utils/path.js')
+    const { parse: parseToml } = await import('smol-toml')
+
+    await writeMcpConfig('codex', [
+      { name: 'ns-benchmark', url: 'https://benchmark.mcp.saas.nodesource.io/mcp', headers: { 'X-Nsolid-Service-Token': 'dummy-token', 'X-Nsolid-Org-Id': 'dummy-org' } },
+      { name: 'nsolid-console', url: 'https://console.mcp.saas.nodesource.io/mcp', headers: { 'X-Nsolid-Service-Token': 'dummy-token' } },
+      { name: 'ncm', url: 'https://ncm.mcp.saas.nodesource.io/mcp', headers: { 'X-Nsolid-Service-Token': 'dummy-token' } },
+    ])
+
+    const content = parseToml(readFileSync(resolveHome('~/.codex/config.toml'), 'utf-8')) as Record<string, unknown>
+    const servers = content.mcp_servers as Record<string, Record<string, unknown>>
+    // Codex's native parser recognizes http_headers, not headers.
+    assert.deepStrictEqual(servers['ns-benchmark'].http_headers, { 'X-Nsolid-Service-Token': 'dummy-token', 'X-Nsolid-Org-Id': 'dummy-org' })
+    assert.deepStrictEqual(servers['nsolid-console'].http_headers, { 'X-Nsolid-Service-Token': 'dummy-token' })
+    assert.deepStrictEqual(servers['ncm'].http_headers, { 'X-Nsolid-Service-Token': 'dummy-token' })
+    assert.strictEqual(servers['ns-benchmark'].headers, undefined)
+    assert.strictEqual(servers['nsolid-console'].headers, undefined)
+    assert.strictEqual(servers['ncm'].headers, undefined)
+  })
+
+  it('repairs legacy wrong-key Codex headers upon rewrite with fresh values winning stale config', async () => {
+    const { writeMcpConfig } = await import('../../../src/mcp/mcp-config-writer.js')
+    const { resolveHome } = await import('../../../src/utils/path.js')
+    const { mkdirSync } = await import('node:fs')
+    const { dirname } = await import('node:path')
+    const { parse: parseToml } = await import('smol-toml')
+
+    const configPath = resolveHome('~/.codex/config.toml')
+    mkdirSync(dirname(configPath), { recursive: true })
+    writeFileSync(configPath, [
+      '[mcp_servers.ns-benchmark]',
+      'url = "https://benchmark.mcp.saas.nodesource.io/mcp"',
+      '',
+      '[mcp_servers.ns-benchmark.headers]',
+      'X-Nsolid-Service-Token = "stale-token"',
+      'X-Nsolid-Org-Id = "stale-org"',
+    ].join('\n') + '\n')
+
+    await writeMcpConfig('codex', [{
+      name: 'ns-benchmark',
+      url: 'https://benchmark.mcp.saas.nodesource.io/mcp',
+      headers: { 'X-Nsolid-Service-Token': 'dummy-token', 'X-Nsolid-Org-Id': 'dummy-org' },
+    }])
+
+    const content = parseToml(readFileSync(configPath, 'utf-8')) as Record<string, unknown>
+    const servers = content.mcp_servers as Record<string, Record<string, unknown>>
+    // Fresh supplied headers win the stale config, under the recognized key.
+    assert.deepStrictEqual(servers['ns-benchmark'].http_headers, { 'X-Nsolid-Service-Token': 'dummy-token', 'X-Nsolid-Org-Id': 'dummy-org' })
+    assert.strictEqual(servers['ns-benchmark'].headers, undefined)
+  })
+
+  it('round-trips recognized native Codex http_headers and preserves other keys', async () => {
+    const { writeMcpConfig } = await import('../../../src/mcp/mcp-config-writer.js')
+    const { resolveHome } = await import('../../../src/utils/path.js')
+    const { mkdirSync } = await import('node:fs')
+    const { dirname } = await import('node:path')
+    const { parse: parseToml } = await import('smol-toml')
+
+    const configPath = resolveHome('~/.codex/config.toml')
+    mkdirSync(dirname(configPath), { recursive: true })
+    writeFileSync(configPath, [
+      '[mcp_servers.myserver]',
+      'url = "http://localhost:3000"',
+      'bearer_token_env_var = "MY_TOKEN"',
+      '',
+      '[mcp_servers.myserver.http_headers]',
+      'X-User = "keep"',
+    ].join('\n') + '\n')
+
+    await writeMcpConfig('codex', [serverA])
+
+    const content = parseToml(readFileSync(configPath, 'utf-8')) as Record<string, unknown>
+    const servers = content.mcp_servers as Record<string, Record<string, unknown>>
+    assert.deepStrictEqual(servers.myserver.http_headers, { 'X-User': 'keep' })
+    assert.strictEqual(servers.myserver.bearer_token_env_var, 'MY_TOKEN')
+  })
+
+  it('preserves both header spellings on a third-party Codex HTTP entry (native stays native, legacy stays inert)', async () => {
+    const { writeMcpConfig } = await import('../../../src/mcp/mcp-config-writer.js')
+    const { resolveHome } = await import('../../../src/utils/path.js')
+    const { mkdirSync } = await import('node:fs')
+    const { dirname } = await import('node:path')
+    const { parse: parseToml } = await import('smol-toml')
+
+    const configPath = resolveHome('~/.codex/config.toml')
+    mkdirSync(dirname(configPath), { recursive: true })
+    writeFileSync(configPath, [
+      '[mcp_servers.conflict]',
+      'url = "http://localhost:3000"',
+      '',
+      '[mcp_servers.conflict.http_headers]',
+      'X-Nsolid-Service-Token = "native-dummy-token"',
+      '',
+      '[mcp_servers.conflict.headers]',
+      'X-Nsolid-Service-Token = "legacy-dummy-token"',
+    ].join('\n') + '\n')
+
+    await writeMcpConfig('codex', [serverA])
+
+    const content = parseToml(readFileSync(configPath, 'utf-8')) as Record<string, unknown>
+    const servers = content.mcp_servers as Record<string, Record<string, unknown>>
+    // A third-party entry is not NodeSource-owned: the rewrite must not
+    // promote its inert legacy table to the key the native parser honors.
+    assert.deepStrictEqual(servers.conflict.http_headers, { 'X-Nsolid-Service-Token': 'native-dummy-token' })
+    assert.deepStrictEqual(servers.conflict.headers, { 'X-Nsolid-Service-Token': 'legacy-dummy-token' })
+  })
+
+  it('leaves a legacy headers-only third-party Codex HTTP entry inert', async () => {
+    const { writeMcpConfig } = await import('../../../src/mcp/mcp-config-writer.js')
+    const { resolveHome } = await import('../../../src/utils/path.js')
+    const { mkdirSync } = await import('node:fs')
+    const { dirname } = await import('node:path')
+    const { parse: parseToml } = await import('smol-toml')
+
+    const configPath = resolveHome('~/.codex/config.toml')
+    mkdirSync(dirname(configPath), { recursive: true })
+    writeFileSync(configPath, [
+      '[mcp_servers.thirdparty]',
+      'url = "https://third.example.com/mcp"',
+      '',
+      '[mcp_servers.thirdparty.headers]',
+      'X-Third-Party = "inert"',
+    ].join('\n') + '\n')
+
+    await writeMcpConfig('codex', [serverA])
+
+    const content = parseToml(readFileSync(configPath, 'utf-8')) as Record<string, unknown>
+    const servers = content.mcp_servers as Record<string, Record<string, unknown>>
+    assert.strictEqual(servers.thirdparty.url, 'https://third.example.com/mcp')
+    assert.deepStrictEqual(servers.thirdparty.headers, { 'X-Third-Party': 'inert' })
+    assert.strictEqual(servers.thirdparty.http_headers, undefined, 'inert legacy headers must not become active')
+  })
+
+  it('keeps fresh desired headers authoritative for owned entries and drops stale on-disk keys', async () => {
+    const { writeMcpConfig } = await import('../../../src/mcp/mcp-config-writer.js')
+    const { resolveHome } = await import('../../../src/utils/path.js')
+    const { mkdirSync } = await import('node:fs')
+    const { dirname } = await import('node:path')
+    const { parse: parseToml } = await import('smol-toml')
+
+    const configPath = resolveHome('~/.codex/config.toml')
+    mkdirSync(dirname(configPath), { recursive: true })
+    // Native (active) and legacy (inert) tables, each carrying a key that the
+    // fresh desired set no longer contains.
+    writeFileSync(configPath, [
+      '[mcp_servers.nsolid-console]',
+      'url = "https://console.mcp.saas.nodesource.io/mcp"',
+      '',
+      '[mcp_servers.nsolid-console.http_headers]',
+      'X-Nsolid-Service-Token = "stale-native-token"',
+      'X-Nsolid-Org-Id = "stale-native-org"',
+      '',
+      '[mcp_servers.nsolid-console.headers]',
+      'X-Nsolid-Service-Token = "stale-legacy-token"',
+      'X-Legacy-Only = "inert"',
+    ].join('\n') + '\n')
+
+    await writeMcpConfig('codex', [{
+      name: 'nsolid-console',
+      url: 'https://console.mcp.saas.nodesource.io/mcp',
+      headers: { 'X-Nsolid-Service-Token': 'fresh-dummy-token' },
+    }])
+
+    const content = parseToml(readFileSync(configPath, 'utf-8')) as Record<string, unknown>
+    const servers = content.mcp_servers as Record<string, Record<string, unknown>>
+    assert.deepStrictEqual(servers['nsolid-console'].http_headers, { 'X-Nsolid-Service-Token': 'fresh-dummy-token' })
+    assert.strictEqual(servers['nsolid-console'].headers, undefined)
+  })
+
+  it('preserves third-party stdio entries verbatim even with a headers key', async () => {
+    const { writeMcpConfig } = await import('../../../src/mcp/mcp-config-writer.js')
+    const { resolveHome } = await import('../../../src/utils/path.js')
+    const { mkdirSync } = await import('node:fs')
+    const { dirname } = await import('node:path')
+    const { parse: parseToml } = await import('smol-toml')
+
+    const configPath = resolveHome('~/.codex/config.toml')
+    mkdirSync(dirname(configPath), { recursive: true })
+    writeFileSync(configPath, [
+      '[mcp_servers.mystdio]',
+      'command = "uvx"',
+      'args = ["mcp-server-fetch"]',
+      '',
+      '[mcp_servers.mystdio.headers]',
+      'X-Stdio = "verbatim"',
+    ].join('\n') + '\n')
+
+    await writeMcpConfig('codex', [serverA])
+
+    const content = parseToml(readFileSync(configPath, 'utf-8')) as Record<string, unknown>
+    const servers = content.mcp_servers as Record<string, Record<string, unknown>>
+    // Codex only honors headers on HTTP-transport entries; stdio entries pass
+    // through untouched (the key was and stays inert for the native parser).
+    assert.deepStrictEqual(servers.mystdio.headers, { 'X-Stdio': 'verbatim' })
+    assert.strictEqual(servers.mystdio.http_headers, undefined)
+  })
+
+  it('native Codex parser ignores legacy headers and reads rewritten http_headers', { skip: !codexCliAvailable }, async () => {
+    const { writeMcpConfig } = await import('../../../src/mcp/mcp-config-writer.js')
+    const { resolveHome } = await import('../../../src/utils/path.js')
+    const { mkdirSync } = await import('node:fs')
+    const { dirname } = await import('node:path')
+
+    const configPath = resolveHome('~/.codex/config.toml')
+    mkdirSync(dirname(configPath), { recursive: true })
+    writeFileSync(configPath, [
+      '[mcp_servers.ns-benchmark]',
+      'url = "https://benchmark.mcp.saas.nodesource.io/mcp"',
+      '',
+      '[mcp_servers.ns-benchmark.headers]',
+      'X-Nsolid-Service-Token = "stale-dummy-token"',
+      '',
+      '[mcp_servers.nsolid-console]',
+      'url = "https://console.mcp.saas.nodesource.io/mcp"',
+      '',
+      '[mcp_servers.nsolid-console.headers]',
+      'X-Nsolid-Service-Token = "stale-dummy-token"',
+      '',
+      '[mcp_servers.ncm]',
+      'url = "https://ncm.mcp.saas.nodesource.io/mcp"',
+      '',
+      '[mcp_servers.ncm.http_headers]',
+      'X-Nsolid-Service-Token = "native-dummy-token"',
+    ].join('\n') + '\n')
+
+    // Codex only measures http_headers: legacy `headers` tables are invisible.
+    assert.strictEqual(readNativeCodexTransport('ns-benchmark').http_headers, null)
+    assert.deepStrictEqual(
+      readNativeCodexTransport('ncm').http_headers,
+      { 'X-Nsolid-Service-Token': 'native-dummy-token' }
+    )
+
+    // An explicit rewrite repairs the legacy entries under the recognized key.
+    await writeMcpConfig('codex', [
+      { name: 'ns-benchmark', url: 'https://benchmark.mcp.saas.nodesource.io/mcp', headers: { 'X-Nsolid-Service-Token': 'fresh-dummy-token', 'X-Nsolid-Org-Id': 'fresh-dummy-org' } },
+      { name: 'nsolid-console', url: 'https://console.mcp.saas.nodesource.io/mcp', headers: { 'X-Nsolid-Service-Token': 'fresh-dummy-token' } },
+      { name: 'ncm', url: 'https://ncm.mcp.saas.nodesource.io/mcp', headers: { 'X-Nsolid-Service-Token': 'fresh-dummy-token' } },
+    ])
+
+    const expectedHeaders: Record<string, Record<string, string>> = {
+      'ns-benchmark': { 'X-Nsolid-Service-Token': 'fresh-dummy-token', 'X-Nsolid-Org-Id': 'fresh-dummy-org' },
+      'nsolid-console': { 'X-Nsolid-Service-Token': 'fresh-dummy-token' },
+      ncm: { 'X-Nsolid-Service-Token': 'fresh-dummy-token' },
+    }
+    for (const [name, headers] of Object.entries(expectedHeaders)) {
+      assert.deepStrictEqual(readNativeCodexTransport(name).http_headers, headers)
+    }
   })
 })
 

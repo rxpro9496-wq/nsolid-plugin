@@ -1,5 +1,6 @@
 import { readFileSync, existsSync } from 'node:fs'
 import path from 'node:path'
+import { isNodeSourceMcpServerName } from '../types.js'
 import type { HarnessType, McpServerRef } from '../types.js'
 import { resolveHome } from '../utils/path.js'
 import { readJsonFile, readTomlFile, readJsoncFile, writeTomlFileSync } from '../utils/config.js'
@@ -76,6 +77,11 @@ export function readExistingConfig (
   }
 }
 
+/** Read a recorded path with the same harness-specific schema used by removal. */
+export function readHarnessMcpConfig (harness: HarnessType, configPath: string): NormalizedMcpConfig {
+  return readExistingConfig(configPath, formatFromPath(configPath), getMcpConfigInfo(harness)?.jsonMcpKey)
+}
+
 function normalizeFromJson (data: Record<string, unknown>, jsonMcpKey: 'mcpServers' | 'mcp'): NormalizedMcpConfig {
   const mcpRaw = data[jsonMcpKey]
   if (mcpRaw && typeof mcpRaw === 'object' && !Array.isArray(mcpRaw)) {
@@ -104,9 +110,52 @@ function normalizeFromJson (data: Record<string, unknown>, jsonMcpKey: 'mcpServe
 function normalizeFromToml (data: Record<string, unknown>): NormalizedMcpConfig {
   const mcpServersRaw = data.mcp_servers
   if (mcpServersRaw && typeof mcpServersRaw === 'object' && !Array.isArray(mcpServersRaw)) {
-    return { mcpServers: mcpServersRaw as NormalizedMcpConfig['mcpServers'] }
+    const servers = {} as NormalizedMcpConfig['mcpServers']
+    for (const [name, srv] of Object.entries(mcpServersRaw)) {
+      if (srv && typeof srv === 'object' && !Array.isArray(srv)) {
+        servers[name] = normalizeCodexTomlServer(name, srv as Record<string, unknown>)
+      } else {
+        servers[name] = srv as unknown as NormalizedMcpConfig['mcpServers'][string]
+      }
+    }
+    return { mcpServers: servers }
   }
   return { mcpServers: {} }
+}
+
+/**
+ * Codex's native parser recognizes `[mcp_servers.<name>.http_headers]` for
+ * HTTP-transport entries. The internal model uses `headers`, so reading
+ * normalizes recognized keys into it and writing serializes it back (the
+ * inverse lives in applyHarnessWriteFormat's codex branch). On conflicting
+ * keys the recognized native `http_headers` wins: that is the only table the
+ * native parser has been honoring, so migration must not change the values
+ * Codex actually uses. Legacy NodeSource versions serialized the wrong key
+ * (`headers`), which the native parser ignores — adopting it here is what
+ * makes rewrites migrate those entries to the correct key.
+ *
+ * Only NodeSource-generated entries are migrated. A third-party HTTP entry is
+ * returned verbatim: promoting its inert `headers` table to the active
+ * `http_headers` key would silently change which headers the native parser
+ * honors. Non-HTTP entries (third-party stdio servers) pass through verbatim
+ * for the same reason.
+ */
+function normalizeCodexTomlServer (name: string, srv: Record<string, unknown>): NormalizedMcpConfig['mcpServers'][string] {
+  if (typeof srv.url !== 'string' || !isNodeSourceMcpServerName(name)) {
+    return srv as NormalizedMcpConfig['mcpServers'][string]
+  }
+
+  const { headers: legacyHeaders, http_headers: nativeHeaders, ...rest } = srv
+  const recognizedHeaders =
+    (nativeHeaders && typeof nativeHeaders === 'object' && !Array.isArray(nativeHeaders))
+      ? nativeHeaders as Record<string, string>
+      : (legacyHeaders && typeof legacyHeaders === 'object' && !Array.isArray(legacyHeaders))
+          ? legacyHeaders as Record<string, string>
+          : undefined
+  return {
+    ...rest,
+    ...(recognizedHeaders ? { headers: recognizedHeaders } : {}),
+  } as unknown as NormalizedMcpConfig['mcpServers'][string]
 }
 
 function writeConfigFile (
@@ -399,6 +448,30 @@ function applyHarnessWriteFormat (
     return { mcpServers: servers }
   }
 
+  if (harness === 'codex') {
+    // Serialize the internal model's `headers` with Codex's recognized key
+    // `http_headers`, and drop legacy wrong-key tables. The inverse lives in
+    // normalizeCodexTomlServer. Only NodeSource-generated HTTP entries are
+    // migrated; third-party HTTP entries keep their original keys (an inert
+    // legacy `headers` table must not be promoted to the active native key)
+    // and stdio entries pass through verbatim.
+    const servers = {} as NormalizedMcpConfig['mcpServers']
+    for (const [name, srv] of Object.entries(config.mcpServers)) {
+      if (typeof srv.url === 'string' && isNodeSourceMcpServerName(name)) {
+        const { headers, http_headers: _staleHttpHeaders, ...rest } = srv
+        servers[name] = {
+          ...rest,
+          ...(headers && typeof headers === 'object'
+            ? { http_headers: headers as Record<string, string> }
+            : {}),
+        } as unknown as NormalizedMcpConfig['mcpServers'][string]
+      } else {
+        servers[name] = srv
+      }
+    }
+    return { mcpServers: servers }
+  }
+
   if (harness !== 'antigravity') return config
 
   const servers = {} as NormalizedMcpConfig['mcpServers']
@@ -439,6 +512,19 @@ export async function writeMcpConfig (
   }
 
   const existing = readExistingConfig(resolvedPath, format, jsonMcpKey)
+  if (harness === 'codex') {
+    // Fresh desired headers are authoritative for NodeSource-generated
+    // entries that this write covers: dropping the previous header tables
+    // before the merge keeps a legacy inert `headers` table (wrong key) or a
+    // removed org/token key from being re-activated or retained. The global
+    // merge semantics stay unchanged for every other caller.
+    for (const server of resolvedServers) {
+      if (!isNodeSourceMcpServerName(server.name)) continue
+      const current = existing.mcpServers[server.name]
+      if (!current) continue
+      existing.mcpServers[server.name] = { ...current, headers: {} }
+    }
+  }
   const merged = mergeMcpConfig(existing, resolvedServers)
 
   backupMcpConfig(harness, resolvedPath, options?.logger)
@@ -472,7 +558,7 @@ export async function removeMcpConfig (
     : (info?.format ?? formatFromPath(resolvedPath))
   const jsonMcpKey = info?.jsonMcpKey ?? 'mcpServers'
 
-  const existing = readExistingConfig(resolvedPath, format, jsonMcpKey)
+  const existing = readHarnessMcpConfig(harness, resolvedPath)
   const result = removeMcpServers(existing, serverNames)
 
   backupMcpConfig(harness, resolvedPath, options?.logger)

@@ -173,7 +173,7 @@ describe('uninstall() credential purge', () => {
     assert.ok(existsSync(getAuthFilePath()), 'credentials preserved with keepCredentials')
   })
 
-  it('does not purge credentials in best-effort cleanup', async () => {
+  it('does not purge credentials when a no-tracking cleanup refuses', async () => {
     const { install, uninstall } = await import('../../../src/index.js')
     const { getAuthFilePath, getTrackingFilePath } = await import('../../../src/utils/path.js')
 
@@ -185,9 +185,12 @@ describe('uninstall() credential purge', () => {
     await install({ harness: 'claude', bundlePath, skillsSource })
     unlinkSync(getTrackingFilePath())
 
-    const result = await uninstall('claude')
-
-    assert.ok(!result.credentialsPurged, 'credentialsPurged is falsy in best-effort path')
-    assert.ok(existsSync(getAuthFilePath()), 'credentials preserved in best-effort cleanup')
+    // Losing the tracking file leaves shared ns-* content unattributable: the
+    // whole selection refuses before effects (and never purges auth).
+    await assert.rejects(
+      () => uninstall('claude'),
+      (err: any) => { assert.strictEqual(err.code, 'UNINSTALL_PREFLIGHT_FAILED'); return true }
+    )
+    assert.ok(existsSync(getAuthFilePath()), 'credentials preserved when the no-tracking cleanup refuses')
   })
 })

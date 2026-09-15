@@ -5,9 +5,9 @@ import { createInterface } from 'node:readline/promises'
 import path from 'node:path'
 import { existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { installWithRuntime, setup, uninstall, logout, doctor, restore, loadCredentials } from './index.js'
+import { installWithRuntime, setup, uninstallHarnesses, logout, doctor, restore, loadCredentials, assertNoActiveExternalMcp, assertExternalMcpSetupPreflight } from './index.js'
 import type { AuthConfirmation, HarnessType } from './types.js'
-import { HARNESS_VALUES, PLUGIN_OWNED_HARNESSES } from './types.js'
+import { HARNESS_VALUES, PLUGIN_OWNED_HARNESSES, EXTERNAL_MCP_HARNESSES } from './types.js'
 import { formatPluginError } from './errors.js'
 import { listConfigBackups } from './utils/backup.js'
 import { C, supportsColor } from './utils/format.js'
@@ -56,7 +56,7 @@ function printUsage (): void {
 Commands:
   setup      Authenticate with NodeSource and prepare the MCP bridge runtime (may open a browser; first run needs npm access)
   install    Install N|Solid Plugin skills/MCP for a harness (fallback direct installer; prepares the MCP bridge runtime first; does not open a browser)
-  uninstall  Remove N|Solid Plugin skills for a harness
+  uninstall  Remove the selected harness's N|Solid skills, MCP entries, native plugin, and marketplace registration
   logout     Forget your stored NodeSource login (removes credentials only)
   switch-org Force re-authentication to switch NodeSource organizations (opens a browser; affects all harnesses)
   doctor     Check installation health for a harness
@@ -75,6 +75,7 @@ Options:
   --quiet               Suppress step-by-step progress output (setup/install/switch-org)
   --yes                 Skip interactive confirmation prompts
   --accounts-url <url>  Explicit origin-only accounts URL override for setup/switch-org
+  --external-mcp        Experimental (setup/switch-org/uninstall, claude/codex/antigravity only): setup/switch-org authenticate and write direct HTTP MCP config without preparing the mcp-remote bridge runtime or copying/linking skills. uninstall always performs the complete selected-harness cleanup (skills, MCP entries, native plugin, marketplace registration); the flag is accepted but does not narrow it.
   --help                Show this help message
 
 Distribution notes:
@@ -243,6 +244,7 @@ async function main (): Promise<void> {
       'keep-credentials': { type: 'boolean' },
       quiet: { type: 'boolean' },
       yes: { type: 'boolean' },
+      'external-mcp': { type: 'boolean' },
       help: { type: 'boolean', short: 'H' },
     },
   })
@@ -254,6 +256,22 @@ async function main (): Promise<void> {
 
   const command = positionals[0]
   const harness = values.harness as HarnessType | undefined
+
+  // Experimental --external-mcp: reject unsupported commands/harnesses BEFORE
+  // any side effects (no auth, no config writes, no runtime changes).
+  const externalMcpFlag = values['external-mcp'] === true
+  if (externalMcpFlag && command !== 'setup' && command !== 'switch-org' && command !== 'uninstall') {
+    console.error(`Error: --external-mcp is only supported on setup, switch-org, and uninstall (got: ${command}).`)
+    process.exit(1)
+  }
+  const assertExternalMcpHarnesses = (harnesses: HarnessType[]): void => {
+    if (!externalMcpFlag) return
+    const unsupported = harnesses.filter((h) => !EXTERNAL_MCP_HARNESSES.has(h))
+    if (unsupported.length > 0) {
+      console.error(`Error: --external-mcp is only supported for harnesses: ${[...EXTERNAL_MCP_HARNESSES].join(', ')} (unsupported: ${unsupported.join(', ')}).`)
+      process.exit(1)
+    }
+  }
 
   const resolveHarnesses = async (multiple: boolean): Promise<HarnessType[]> => {
     if (harness && HARNESS_VALUES.includes(harness)) return [harness]
@@ -288,6 +306,12 @@ async function main (): Promise<void> {
         process.env.NSOLID_ACCOUNTS_URL = values['accounts-url']
       }
       const setupHarnesses = await resolveHarnesses(true)
+      // External setup: validate EVERY selected harness (supported set + old
+      // native plugin conflict) before the loop mutates the first one.
+      if (externalMcpFlag) assertExternalMcpSetupPreflight(setupHarnesses)
+      // Flagless setup: reject every selected harness with an ACTIVE external
+      // MCP record BEFORE the loop so no harness is mutated first.
+      if (!externalMcpFlag) await assertNoActiveExternalMcp(setupHarnesses, 'setup')
       let failures = 0
 
       for (let i = 0; i < setupHarnesses.length; i++) {
@@ -303,6 +327,7 @@ async function main (): Promise<void> {
           confirmAuth: authConfirmation,
           packageOwnedSkills: PACKAGE_OWNED_SKILL_HARNESSES.has(setupHarness),
           harnessSpecificSkills: HARNESS_SPECIFIC_SKILL_HARNESSES.has(setupHarness),
+          externalMcp: externalMcpFlag,
         })
 
         if (!result.success) {
@@ -315,6 +340,13 @@ async function main (): Promise<void> {
         }
 
         const verb = result.hadToAuthenticate ? 'Authenticated' : 'Credentials ready'
+        if (externalMcpFlag) {
+          const { getAdapter } = await import('./harnesses/index.js')
+          console.log(`${paint.green('✓')} ${HARNESS_LABELS[setupHarness]} — ${verb}; direct HTTP MCP configured (--external-mcp; no bridge runtime, skills provided by the external plugin package).`)
+          console.log(`  ${paint.dim('MCP config:')} ${getAdapter(setupHarness).getMcpConfigPath()}`)
+          console.log(`  ${paint.dim('MCP servers:')} ${result.mcpServersConfigured.join(', ')}`)
+          continue
+        }
         console.log(`${paint.green('✓')} ${HARNESS_LABELS[setupHarness]} — ${verb}; MCP bridge ready.`)
       }
 
@@ -323,6 +355,7 @@ async function main (): Promise<void> {
     }
     case 'install': {
       const installHarnesses = await resolveHarnesses(true)
+      await assertNoActiveExternalMcp(installHarnesses, 'install')
       let failures = 0
       const pluginOwnedReady = new Set<HarnessType>()
 
@@ -403,24 +436,45 @@ async function main (): Promise<void> {
       break
     }
     case 'uninstall': {
-      const uninstallHarnesses = await resolveHarnesses(true)
+      const selectedHarnesses = await resolveHarnesses(true)
+      if (externalMcpFlag) assertExternalMcpHarnesses(selectedHarnesses)
+
+      // Complete selected-harness cleanup: skills, MCP entries, native plugin,
+      // and marketplace registration. Plain and --external-mcp are the same
+      // operation under the owner contract. A harness with recorded external
+      // ownership is routed through the safe external cleanup (fingerprint-
+      // verified entries) rather than a by-name sweep. The whole selection is
+      // preflighted first, so an edited/ambiguous owned entry or a shared
+      // marketplace aborts with nothing removed.
+      const batch = await uninstallHarnesses(selectedHarnesses, {
+        bundlePath: values.bundle,
+        ...commonOptions,
+        keepCredentials: values['keep-credentials'] === true,
+        externalMcp: externalMcpFlag,
+      })
+
       let failures = 0
       let credentialsPurged = false
-      for (const uninstallHarness of uninstallHarnesses) {
-        const result = await uninstall(uninstallHarness, {
-          bundlePath: values.bundle,
-          ...commonOptions,
-          keepCredentials: values['keep-credentials'] === true,
+      for (let i = 0; i < selectedHarnesses.length; i++) {
+        const selectedHarness = selectedHarnesses[i]
+        const result = batch.results[i]
+        const parts = result.stages.map((entry) => {
+          const icon = entry.status === 'removed'
+            ? paint.green('✓')
+            : entry.status === 'not-present'
+              ? paint.dim('•')
+              : paint.yellow('!')
+          return `${icon} ${entry.stage}: ${entry.status}${entry.detail ? ` (${entry.detail})` : ''}`
         })
         if (result.errors.length > 0) {
           failures++
-          console.error(`Uninstall completed with errors for ${uninstallHarness}:`)
-          for (const err of result.errors) {
-            console.error(`  - ${err}`)
-          }
+          console.error(`Uninstall completed with errors for ${HARNESS_LABELS[selectedHarness]} (${selectedHarness}):`)
+          for (const part of parts) console.error(`  ${part}`)
+          for (const err of result.errors) console.error(`  - ${err}`)
           continue
         }
-        console.log(`Uninstalled N|Solid Plugin skills for ${uninstallHarness}`)
+        console.log(`${paint.green('✓')} Uninstalled N|Solid for ${HARNESS_LABELS[selectedHarness]} (${selectedHarness}):`)
+        for (const part of parts) console.log(`  ${part}`)
         credentialsPurged = credentialsPurged || result.credentialsPurged === true
       }
       if (credentialsPurged) {
@@ -428,7 +482,7 @@ async function main (): Promise<void> {
         console.log(fmt('No NodeSource installs remain — removed stored credentials.'))
         console.log(fmt('  Re-run any install to authenticate again.'))
       }
-      if (failures > 0) process.exit(1)
+      if (failures > 0 || !batch.success) process.exit(1)
       break
     }
     case 'logout': {
@@ -438,6 +492,17 @@ async function main (): Promise<void> {
       } else {
         console.log('No credentials found — nothing to log out.')
       }
+      // External setups bake the token into harness configs. Removing the
+      // shared auth file is a local forget only: those copies survive and no
+      // server-side revocation happens, so say so explicitly.
+      const { readTrackingFile, hasExternalMcpState } = await import('./skills/index.js')
+      const tracking = await readTrackingFile()
+      if (hasExternalMcpState(tracking)) {
+        const warn = (s: string) => color ? `\x1b[33m${s}\x1b[0m` : s
+        console.log(warn('⚠ Tokens already copied into harness MCP configs remain valid until they expire; nothing was revoked server-side.'))
+        console.log(warn('  Remove local copies with: nsolid-plugin uninstall --external-mcp --harness <harness>'))
+        console.log(warn('  Revoke the token in the NodeSource console to invalidate it everywhere.'))
+      }
       break
     }
     case 'switch-org': {
@@ -445,6 +510,10 @@ async function main (): Promise<void> {
         process.env.NSOLID_ACCOUNTS_URL = values['accounts-url']
       }
       const switchHarness = await requireHarness()
+      assertExternalMcpHarnesses([switchHarness])
+      // Flagless switch-org on an ACTIVE external harness is rejected BEFORE
+      // the shared-login warning and the OAuth round trip.
+      if (!externalMcpFlag) await assertNoActiveExternalMcp([switchHarness], 'switch-org')
 
       const previous = (() => {
         try { return loadCredentials() } catch { return null }
@@ -465,6 +534,7 @@ async function main (): Promise<void> {
         packageOwnedSkills: PACKAGE_OWNED_SKILL_HARNESSES.has(switchHarness),
         harnessSpecificSkills: HARNESS_SPECIFIC_SKILL_HARNESSES.has(switchHarness),
         force: true,
+        externalMcp: externalMcpFlag,
       })
 
       const current = (() => {
@@ -482,6 +552,7 @@ async function main (): Promise<void> {
         harness: switchHarness,
         harnessLabel: HARNESS_LABELS[switchHarness],
         isPluginOwned: PLUGIN_OWNED_HARNESSES.has(switchHarness),
+        externalMcp: externalMcpFlag,
       })
 
       if (outcome.kind === 'auth-failed') {
@@ -507,9 +578,14 @@ async function main (): Promise<void> {
 
       let nativeInstalled = false
       let fallbackTracked = false
-      if (PLUGIN_OWNED_HARNESSES.has(switchHarness)) {
+      if (!externalMcpFlag && PLUGIN_OWNED_HARNESSES.has(switchHarness)) {
         const { getAdapter } = await import('./harnesses/index.js')
-        nativeInstalled = getAdapter(switchHarness).detectNativePlugin?.()?.installed === true
+        const { legacyNsolidPluginIds } = await import('./harnesses/plugin-name.js')
+        // Only the LEGACY native plugin serves MCP via the harness (and reads
+        // credentials live on reconnect); a skills-only install owns skills
+        // alone, so it must not trigger the native-MCP reconnect guidance.
+        const detected = getAdapter(switchHarness).detectNativePlugin?.()
+        nativeInstalled = detected?.installed === true && legacyNsolidPluginIds(detected).length > 0
         const { listTrackedMcps } = await import('./mcp/index.js')
         fallbackTracked = (await listTrackedMcps(switchHarness)).length > 0
       }
@@ -519,11 +595,16 @@ async function main (): Promise<void> {
         isPluginOwned: PLUGIN_OWNED_HARNESSES.has(switchHarness),
         nativeInstalled,
         fallbackTracked,
+        externalMcp: externalMcpFlag,
       }, color)) {
         console.log(guidanceLine)
       }
 
-      console.log(paint.dim('  Other direct-config harnesses sharing this login (OpenCode, Pi, fallback CLI installs) pick up the new org on their next setup/install run.'))
+      if (externalMcpFlag) {
+        console.log(paint.dim('  Other harnesses configured with --external-mcp keep the previous org in their MCP config; refresh each explicitly with: nsolid-plugin setup --harness <harness> --external-mcp'))
+      } else {
+        console.log(paint.dim('  Other direct-config harnesses sharing this login (OpenCode, Pi, fallback CLI installs) pick up the new org on their next setup/install run.'))
+      }
       break
     }
     case 'restore': {

@@ -2,7 +2,7 @@ import path from 'node:path'
 import { existsSync, unlinkSync } from 'node:fs'
 import type { HarnessType, Logger } from '../types.js'
 import type { McpTrackingEntry, TrackingData } from '../skills/skill-tracker.js'
-import { readTrackingFile, writeTrackingFile } from '../skills/skill-tracker.js'
+import { readTrackingFile, writeTrackingFile, hasDurableState } from '../skills/skill-tracker.js'
 import { getTrackingFilePath, resolveHome } from '../utils/path.js'
 
 export type { McpTrackingEntry } from '../skills/skill-tracker.js'
@@ -61,7 +61,7 @@ export async function removeTrackedMcps (
     return !serverNames.includes(entry.name)
   })
 
-  if (tracking.skills.length === 0 && tracking.mcpServers.length === 0) {
+  if (tracking.skills.length === 0 && tracking.mcpServers.length === 0 && !hasDurableState(tracking)) {
     const filePath = getTrackingFilePath()
     if (existsSync(filePath)) {
       unlinkSync(filePath)

@@ -64,11 +64,13 @@ type RuntimeBehavior = 'provision' | 'fail'
 const runtimeControl = {
   behavior: 'provision' as RuntimeBehavior,
   ensureCalls: 0,
+  inspectCalls: 0,
   provisions: 0,
 }
 function resetRuntimeControl (behavior: RuntimeBehavior = 'provision'): void {
   runtimeControl.behavior = behavior
   runtimeControl.ensureCalls = 0
+  runtimeControl.inspectCalls = 0
   runtimeControl.provisions = 0
 }
 
@@ -83,6 +85,7 @@ mock.module('../../src/mcp/mcp-remote-runtime.js', {
     getMcpRemoteRuntimeRoot: () => join(tmpDir, '.agents', 'nsolid-plugin', 'runtime', 'mcp-remote', '0.1.38'),
     resolveNpmCommand: () => { throw new Error('resolveNpmCommand is not part of these tests') },
     inspectMcpRemoteRuntime: () => {
+      runtimeControl.inspectCalls++
       const root = join(tmpDir, '.agents', 'nsolid-plugin', 'runtime', 'mcp-remote', '0.1.38')
       if (!existsSync(root)) return { status: 'missing', version: '0.1.38', root }
       try {
@@ -963,6 +966,283 @@ describe('install()', () => {
   })
 })
 
+describe('setup() with externalMcp (experimental --external-mcp)', () => {
+  /** Authenticated bundle whose MCP servers expand to the resolved org URL/token. */
+  async function createExternalBundle (): Promise<BundleDescriptor> {
+    return createBundle({
+      mcpServers: [
+        { name: 'nsolid-console', url: '$' + '{MCP_URL}', headers: { 'X-Nsolid-Service-Token': '$' + '{AUTH_TOKEN}' } },
+      ],
+      auth: {
+        type: 'oauth',
+        provider: 'nodesource',
+        accountsUrl: 'https://accounts.nodesource.com',
+        callbackPort: await getFreePort(8400, 8500),
+      },
+    })
+  }
+
+  it('authenticates, writes direct HTTP MCP config, and never provisions the runtime or copies skills', async () => {
+    const { setup } = await import('../../src/index.js')
+    const { readJsonFile } = await import('../../src/utils/config.js')
+    const bundlePath = writeBundle(await createExternalBundle())
+    const skillsSource = createSkillSource('ns-test-skill')
+    seedCredentials()
+    globalThis.fetch = OK_FETCH
+    resetRuntimeControl('fail') // any runtime consultation must fail the run
+
+    const result = await setup({ harness: 'claude', bundlePath, skillsSource, progress: SILENT_PROGRESS, externalMcp: true })
+
+    assert.strictEqual(result.success, true)
+    assert.strictEqual(result.authSucceeded, true)
+    assert.deepStrictEqual(result.mcpServersConfigured, ['nsolid-console'])
+    assert.strictEqual(result.skillsInstalled, 0, 'external mode must not copy or link skills')
+    assert.deepStrictEqual(result.errors, [])
+    assert.strictEqual(runtimeControl.ensureCalls, 0, 'external mode must skip ensureMcpRemoteRuntime entirely')
+    assert.strictEqual(runtimeControl.inspectCalls, 0, 'external mode must skip runtime inspection entirely')
+    assert.strictEqual(existsSync(mcpRuntimeRoot()), false, 'no runtime may be downloaded by the external mode')
+    assert.strictEqual(existsSync(join(tmpDir, '.agents', 'skills', 'ns-test-skill')), false, 'no shared skill copies')
+    assert.strictEqual(existsSync(join(tmpDir, '.claude', 'skills', 'ns-test-skill')), false, 'no harness skill links')
+
+    const cfg = readJsonFile<Record<string, any>>(join(tmpDir, '.claude.json'))
+    const server = (cfg?.mcpServers as Record<string, { type?: string; url?: string; headers?: Record<string, string> }>)?.['nsolid-console']
+    assert.ok(server, 'direct HTTP MCP entry must be written')
+    assert.strictEqual(server.url, 'https://mcp.nodesource.com')
+    assert.strictEqual(server.headers?.['X-Nsolid-Service-Token'], 'test-token')
+  })
+
+  it('leaves a preexisting shared runtime completely untouched', async () => {
+    const { setup } = await import('../../src/index.js')
+    const bundlePath = writeBundle(await createExternalBundle())
+    const skillsSource = createSkillSource('ns-test-skill')
+    seedCredentials()
+    seedMcpRemoteRuntime()
+    globalThis.fetch = OK_FETCH
+    resetRuntimeControl('fail')
+
+    const proxyPath = join(mcpRuntimeRoot(), 'node_modules', 'mcp-remote', 'dist', 'proxy.js')
+    const before = readFileSync(proxyPath, 'utf8')
+
+    const result = await setup({ harness: 'claude', bundlePath, skillsSource, progress: SILENT_PROGRESS, externalMcp: true })
+
+    assert.strictEqual(result.success, true)
+    assert.strictEqual(runtimeControl.ensureCalls, 0, 'preexisting runtime must not be inspected/repaired via ensure')
+    assert.strictEqual(runtimeControl.inspectCalls, 0, 'preexisting runtime must not be inspected')
+    assert.strictEqual(readFileSync(proxyPath, 'utf8'), before, 'runtime files must be byte-identical after the external run')
+  })
+
+  it('without the flag, setup for Claude still provisions the runtime and leaves MCP config to the plugin', async () => {
+    const { setup } = await import('../../src/index.js')
+    const bundlePath = writeBundle(await createExternalBundle())
+    const skillsSource = createSkillSource('ns-test-skill')
+    seedCredentials()
+    globalThis.fetch = OK_FETCH
+    resetRuntimeControl('provision')
+
+    const result = await setup({ harness: 'claude', bundlePath, skillsSource, progress: SILENT_PROGRESS })
+
+    assert.strictEqual(result.success, true)
+    assert.ok(runtimeControl.ensureCalls >= 1, 'the unflagged baseline must still consult the runtime manager')
+    assert.strictEqual(existsSync(mcpRuntimeRoot()), true, 'the unflagged baseline must provision the bridge runtime')
+    assert.deepStrictEqual(result.mcpServersConfigured, [], 'unflagged Claude setup must not write MCP config')
+    assert.strictEqual(existsSync(join(tmpDir, '.claude.json')), false)
+  })
+
+  it('without the flag, a runtime failure still blocks setup (the external skip is flag-scoped)', async () => {
+    const { setup } = await import('../../src/index.js')
+    const bundlePath = writeBundle(await createExternalBundle())
+    const skillsSource = createSkillSource('ns-test-skill')
+    seedCredentials()
+    globalThis.fetch = OK_FETCH
+    resetRuntimeControl('fail')
+
+    const result = await setup({ harness: 'claude', bundlePath, skillsSource, progress: SILENT_PROGRESS })
+
+    assert.strictEqual(result.success, false)
+    assert.ok(result.errors.some((e) => e.includes('MCP runtime setup failed')))
+    assert.strictEqual(existsSync(join(tmpDir, '.claude.json')), false, 'no MCP config without the flag')
+  })
+
+  it('rejects unsupported harnesses before any side effect (no auth, no config, no runtime)', async () => {
+    const { setup } = await import('../../src/index.js')
+    const bundlePath = writeBundle(await createExternalBundle())
+    const skillsSource = createSkillSource('ns-test-skill')
+    globalThis.fetch = OK_FETCH
+    resetRuntimeControl('fail')
+
+    for (const harness of ['pi', 'opencode'] as const) {
+      browserLaunches.length = 0
+      await assert.rejects(
+        setup({ harness, bundlePath, skillsSource, progress: SILENT_PROGRESS, externalMcp: true }),
+        (err: { code?: string; message?: string }) => {
+          assert.strictEqual(err.code, 'INVALID_OPTION')
+          assert.match(err.message ?? '', /--external-mcp is only supported for harnesses/)
+          return true
+        }
+      )
+      assert.strictEqual(browserLaunches.length, 0, `${harness} must never reach authentication with the flag`)
+      assert.strictEqual(runtimeControl.ensureCalls, 0)
+    }
+    assert.strictEqual(existsSync(join(tmpDir, '.pi', 'agent', 'mcp.json')), false)
+    assert.strictEqual(existsSync(join(tmpDir, '.config', 'opencode')), false)
+  })
+
+  it('stops with guidance when the old native plugin is installed (no duplicate registrations)', async () => {
+    const { setup } = await import('../../src/index.js')
+    const bundlePath = writeBundle(await createExternalBundle())
+    const skillsSource = createSkillSource('ns-test-skill')
+    seedCredentials()
+    globalThis.fetch = OK_FETCH
+    resetRuntimeControl('fail')
+    // Simulate the old native Claude plugin being installed.
+    mkdirSync(join(tmpDir, '.claude', 'plugins'), { recursive: true })
+    writeFileSync(join(tmpDir, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+      version: 2,
+      plugins: { 'nsolid-plugin@nodesource': [{}] },
+    }))
+
+    await assert.rejects(
+      setup({ harness: 'claude', bundlePath, skillsSource, progress: SILENT_PROGRESS, externalMcp: true }),
+      (err: { code?: string; message?: string }) => {
+        assert.strictEqual(err.code, 'INVALID_OPTION')
+        assert.match(err.message ?? '', /native N\|Solid plugin/)
+        return true
+      }
+    )
+
+    assert.strictEqual(browserLaunches.length, 0, 'conflict must be detected before authentication')
+    assert.strictEqual(existsSync(join(tmpDir, '.claude.json')), false, 'no MCP config may be written over the old plugin')
+    assert.strictEqual(runtimeControl.ensureCalls, 0)
+  })
+
+  it('requires uninstalling even a disabled native plugin and does not recommend disabling it', async () => {
+    const { setup, getAdapter } = await import('../../src/index.js')
+    const bundlePath = writeBundle(await createExternalBundle())
+    const skillsSource = createSkillSource('ns-test-skill')
+    resetRuntimeControl('fail')
+    mkdirSync(join(tmpDir, '.claude', 'plugins'), { recursive: true })
+    writeFileSync(join(tmpDir, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+      version: 2,
+      plugins: { 'nsolid-plugin@nodesource': [{}] },
+    }))
+    const settings = JSON.stringify({ enabledPlugins: { 'nsolid-plugin@nodesource': false } })
+    writeFileSync(join(tmpDir, '.claude.json'), settings)
+    assert.strictEqual(getAdapter('claude').detectNativePlugin?.().enabled, false)
+
+    await assert.rejects(
+      setup({ harness: 'claude', bundlePath, skillsSource, progress: SILENT_PROGRESS, externalMcp: true }),
+      (err: { code?: string; action?: string }) => {
+        assert.strictEqual(err.code, 'INVALID_OPTION')
+        assert.match(err.action ?? '', /Uninstall the old plugin first/)
+        assert.match(err.action ?? '', /Disabling it is not sufficient/)
+        assert.doesNotMatch(err.action ?? '', /Remove\/disable/)
+        return true
+      }
+    )
+    assert.strictEqual(browserLaunches.length, 0)
+    assert.strictEqual(runtimeControl.ensureCalls, 0)
+    assert.strictEqual(readFileSync(join(tmpDir, '.claude.json'), 'utf8'), settings)
+  })
+
+  it('authentication failure configures no MCP entries', { timeout: 10000 }, async () => {
+    const { setup } = await import('../../src/index.js')
+    const bundlePath = writeBundle(await createExternalBundle())
+    const skillsSource = createSkillSource('ns-test-skill')
+    globalThis.fetch = OK_FETCH
+    resetRuntimeControl('fail')
+
+    const promise = setup({ harness: 'claude', bundlePath, skillsSource, progress: SILENT_PROGRESS, externalMcp: true, notify: captureAuthNotice, browserLauncher: captureBrowserLauncher })
+    const { state, port } = await pollForState()
+    await sendCallback(port, state, { success: 'false' })
+    const result = await promise
+
+    assert.strictEqual(result.success, false)
+    assert.strictEqual(result.authSucceeded, false)
+    assert.ok(result.errors.some((e) => /Authentication failed/.test(e)))
+    assert.strictEqual(existsSync(join(tmpDir, '.claude.json')), false, 'no MCP config when authentication fails')
+    assert.strictEqual(runtimeControl.ensureCalls, 0, 'external mode must not fall back to runtime provisioning on auth failure')
+  })
+
+  it('configuration failure after authentication reports partial state without success', async () => {
+    const { setup, loadCredentials } = await import('../../src/index.js')
+    const bundlePath = writeBundle(await createExternalBundle())
+    const skillsSource = createSkillSource('ns-test-skill')
+    seedCredentials()
+    globalThis.fetch = OK_FETCH
+    resetRuntimeControl('fail')
+    // Make the Claude config path unwritable-as-a-file (a directory) so the
+    // post-auth MCP config write fails.
+    mkdirSync(join(tmpDir, '.claude.json'), { recursive: true })
+
+    const result = await setup({ harness: 'claude', bundlePath, skillsSource, progress: SILENT_PROGRESS, externalMcp: true })
+
+    assert.strictEqual(result.authSucceeded, true, 'authentication succeeded before the config failure')
+    assert.strictEqual(result.success, false, 'setup must not report success when configuration fails')
+    assert.ok(result.errors.some((e) => /MCP configuration failed/.test(e)))
+    assert.strictEqual(loadCredentials()?.organizationId, 'test-org', 'valid credentials must survive the partial failure')
+  })
+
+  it('repeated runs are idempotent and preserve unrelated MCP entries', async () => {
+    const { setup } = await import('../../src/index.js')
+    const { readJsonFile } = await import('../../src/utils/config.js')
+    const bundlePath = writeBundle(await createExternalBundle())
+    const skillsSource = createSkillSource('ns-test-skill')
+    seedCredentials()
+    globalThis.fetch = OK_FETCH
+    resetRuntimeControl('fail')
+    // Pre-existing config with an unrelated MCP entry and an unrelated top-level key.
+    writeFileSync(join(tmpDir, '.claude.json'), JSON.stringify({
+      mcpServers: {
+        'unrelated-server': { type: 'http', url: 'https://unrelated.example' },
+      },
+      otherTopLevel: { keep: true },
+    }))
+
+    const first = await setup({ harness: 'claude', bundlePath, skillsSource, progress: SILENT_PROGRESS, externalMcp: true })
+    const second = await setup({ harness: 'claude', bundlePath, skillsSource, progress: SILENT_PROGRESS, externalMcp: true })
+
+    assert.strictEqual(first.success, true)
+    assert.strictEqual(second.success, true)
+    assert.deepStrictEqual(second.mcpServersConfigured, ['nsolid-console'])
+
+    const cfg = readJsonFile<Record<string, any>>(join(tmpDir, '.claude.json'))
+    const servers = cfg?.mcpServers as Record<string, unknown>
+    assert.deepStrictEqual(Object.keys(servers).sort(), ['nsolid-console', 'unrelated-server'], 'repeat runs must not duplicate registrations or drop unrelated entries')
+    assert.deepStrictEqual(cfg?.otherTopLevel, { keep: true }, 'unrelated top-level config keys must be preserved')
+  })
+
+  it('switch-org propagates the flag: forced setup rewrites the direct HTTP config without runtime provisioning', { timeout: 10000 }, async () => {
+    const { setup, loadCredentials } = await import('../../src/index.js')
+    const { readJsonFile } = await import('../../src/utils/config.js')
+    const bundlePath = writeBundle(await createExternalBundle())
+    const skillsSource = createSkillSource('ns-test-skill')
+    seedCredentials({ organizationId: 'org-original' })
+    globalThis.fetch = OK_FETCH
+    resetRuntimeControl('fail')
+    // Stale direct config from the previous org.
+    writeFileSync(join(tmpDir, '.claude.json'), JSON.stringify({
+      mcpServers: {
+        'nsolid-console': { type: 'http', url: 'https://org-original.mcp.saas.nodesource.io/', headers: { 'X-Nsolid-Service-Token': 'old-token' } },
+      },
+    }))
+
+    const promise = setup({ harness: 'claude', bundlePath, skillsSource, progress: SILENT_PROGRESS, externalMcp: true, force: true, notify: captureAuthNotice, browserLauncher: captureBrowserLauncher })
+    const { state, port } = await pollForState()
+    await sendCallback(port, state, { consoleId: 'org-456' })
+    const result = await promise
+
+    assert.strictEqual(result.authSucceeded, true)
+    assert.strictEqual(result.success, true)
+    assert.strictEqual(loadCredentials()?.organizationId, 'org-456', 'shared credentials must switch')
+    assert.strictEqual(runtimeControl.ensureCalls, 0, 'switch-org with the flag must not provision the runtime')
+    const cfg = readJsonFile<Record<string, any>>(join(tmpDir, '.claude.json'))
+    const server = (cfg?.mcpServers as Record<string, { url?: string; headers?: Record<string, string> }>)?.['nsolid-console']
+    assert.ok(server, 'direct config must exist after the switch')
+    assert.strictEqual(server.url, 'https://org-456.mcp.saas.nodesource.io/', 'direct config must carry the new org URL')
+    assert.strictEqual(server.headers?.['X-Nsolid-Service-Token'], 'oauth-token', 'direct config must carry the new org token')
+  })
+})
+
 describe('installWithRuntime() dispatcher precondition', () => {
   it('provisions the runtime before OpenCode assets (success path)', async () => {
     const { installWithRuntime } = await import('../../src/index.js')
@@ -1238,6 +1518,50 @@ describe('dispatcher scripts (setup.mjs and the CLI install command)', () => {
     assert.strictEqual(existsSync(join(tmpDir, '.config', 'opencode')), false, 'no assets on failure')
     assert.strictEqual(existsSync(mcpRuntimeRoot()), false, 'nothing published')
   })
+
+  it('the CLI rejects --external-mcp on commands other than setup/switch-org/uninstall before side effects', () => {
+    const result = spawnSync(process.execPath, [
+      '--import', 'tsx/esm',
+      cliEntry, 'install', '--harness', 'claude', '--external-mcp', '--yes',
+      '--bundle', join(repoRoot, 'bundle.json'),
+    ], {
+      cwd: repoRoot,
+      env: { ...process.env, HOME: tmpDir, USERPROFILE: tmpDir },
+      encoding: 'utf8',
+      timeout: 60_000,
+    })
+
+    assert.strictEqual(result.status, 1)
+    assert.match(result.stderr, /--external-mcp is only supported on setup, switch-org, and uninstall/)
+    assert.strictEqual(existsSync(join(tmpDir, '.claude.json')), false, 'no side effects on rejected flag')
+    assert.strictEqual(existsSync(mcpRuntimeRoot()), false, 'no runtime activity on rejected flag')
+  })
+
+  it('the CLI rejects --external-mcp for unsupported harnesses before side effects', () => {
+    const cases: Array<{ command: string; harness: string }> = [
+      { command: 'setup', harness: 'pi' },
+      { command: 'setup', harness: 'opencode' },
+      { command: 'switch-org', harness: 'opencode' },
+    ]
+    for (const { command, harness } of cases) {
+      const result = spawnSync(process.execPath, [
+        '--import', 'tsx/esm',
+        cliEntry, command, '--harness', harness, '--external-mcp', '--yes',
+        '--bundle', join(repoRoot, 'bundle.json'),
+      ], {
+        cwd: repoRoot,
+        env: { ...process.env, HOME: tmpDir, USERPROFILE: tmpDir },
+        encoding: 'utf8',
+        timeout: 60_000,
+      })
+
+      assert.strictEqual(result.status, 1, `${command} --harness ${harness} --external-mcp must exit nonzero`)
+      assert.match(result.stderr, /--external-mcp is only supported for harnesses/, `${command} --harness ${harness} must explain the restriction`)
+    }
+    assert.strictEqual(existsSync(join(tmpDir, '.pi', 'agent', 'mcp.json')), false, 'no side effects on rejected flag')
+    assert.strictEqual(existsSync(join(tmpDir, '.config', 'opencode')), false, 'no side effects on rejected flag')
+    assert.strictEqual(existsSync(join(tmpDir, '.agents', '.nodesource-auth.json')), false, 'no credentials written on rejected flag')
+  })
 })
 
 describe('uninstall()', () => {
@@ -1311,16 +1635,19 @@ describe('uninstall()', () => {
     assert.ok(codexSkills.length > 0, 'codex skills preserved')
   })
 
-  it('handles missing tracking file with best-effort cleanup', async () => {
+  it('refuses a no-tracking uninstall instead of sweeping shared ns-* skills', async () => {
     const { uninstall } = await import('../../src/index.js')
 
     const skillsDir = join(tmpDir, '.agents', 'skills', 'ns-orphan-skill')
     mkdirSync(skillsDir, { recursive: true })
     writeFileSync(join(skillsDir, 'SKILL.md'), '# orphan')
 
-    await uninstall('claude')
+    await assert.rejects(
+      () => uninstall('claude'),
+      (err: any) => { assert.strictEqual(err.code, 'UNINSTALL_PREFLIGHT_FAILED'); return true }
+    )
 
-    assert.ok(!existsSync(skillsDir), 'orphan skill removed from shared directory')
+    assert.ok(existsSync(join(skillsDir, 'SKILL.md')), 'unattributable shared skill preserved')
   })
 
   it('does nothing when no tracking and no orphan skills', async () => {
@@ -1344,17 +1671,18 @@ describe('uninstall()', () => {
     }
   })
 
-  it('emits the hardcoded-MCP-list warning for non-plugin-owned harnesses', async () => {
-    // For CLI-owned harnesses (opencode) the warning is still useful, since the
-    // harness-level MCP config is the source of truth and a hardcoded fallback
-    // genuinely may leave user-added servers behind.
+  it('does not hardcoded-sweep or warn for a no-tracking CLI-owned harness', async () => {
+    // Without a tracking file nothing is attributable: the old hardcoded MCP
+    // name list and warning were removed so no unrelated config can be mutated.
     const { uninstall } = await import('../../src/index.js')
 
     const result = await uninstall('opencode')
     assert.ok(
-      result.errors.some((e) => e.includes('No tracking file and no bundle provided')),
-      'opencode should still emit the hardcoded-MCP-list warning'
+      !result.errors.some((e) => e.includes('No tracking file and no bundle provided')),
+      'the removed hardcoded-MCP-list warning must not surface'
     )
+    assert.strictEqual(result.stages.find((entry) => entry.stage === 'mcp')?.status, 'not-present')
+    assert.strictEqual(result.stages.find((entry) => entry.stage === 'skills')?.status, 'not-present')
   })
 })
 
@@ -1825,5 +2153,92 @@ describe('doctor()', () => {
     assert.ok(report.errors.length > 0)
     assert.strictEqual(report.skills.status, 'unknown')
     assert.strictEqual(report.mcpServers.status, 'unknown')
+  })
+
+  it('reports not-configured MCP for a skills-only native plugin with no MCP config', async () => {
+    // A skills-only native plugin registers no MCP servers, so doctor must
+    // inspect the harness MCP config instead of keeping the initial ok status.
+    const { doctor } = await import('../../src/index.js')
+    seedCredentials()
+    const bundlePath = writeBundle(createBundle())
+    mkdirSync(join(tmpDir, '.claude', 'plugins'), { recursive: true })
+    writeFileSync(join(tmpDir, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+      version: 2,
+      plugins: { 'nsolid-skills-plugin@nodesource': [{ scope: 'user' }] },
+    }))
+
+    const report = await doctor('claude', bundlePath)
+
+    assert.strictEqual(report.plugin.status, 'ok')
+    assert.strictEqual(report.plugin.installed, true)
+    assert.notStrictEqual(report.healthy, true, 'a skills-only native install with no MCP configured is not healthy')
+    assert.strictEqual(report.mcpServers.status, 'unreachable')
+    assert.deepStrictEqual(report.mcpServers.reachable, [])
+    assert.ok(
+      report.errors.some((e) => e.includes('nsolid-plugin setup --harness claude --external-mcp')),
+      `errors should carry the external-mcp remedy, got: ${JSON.stringify(report.errors)}`
+    )
+  })
+
+  it('reports a config read failure for a skills-only native plugin with a malformed MCP config', async () => {
+    const { doctor } = await import('../../src/index.js')
+    seedCredentials()
+    const bundlePath = writeBundle(createBundle())
+    mkdirSync(join(tmpDir, '.claude', 'plugins'), { recursive: true })
+    writeFileSync(join(tmpDir, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+      version: 2,
+      plugins: { 'nsolid-skills-plugin@nodesource': [{ scope: 'user' }] },
+    }))
+    writeFileSync(join(tmpDir, '.claude.json'), '{ not json')
+
+    const report = await doctor('claude', bundlePath)
+
+    assert.notStrictEqual(report.healthy, true, 'an unreadable MCP config is never healthy')
+    assert.notStrictEqual(report.mcpServers.status, 'ok')
+    assert.ok(
+      report.errors.some((e) => e.startsWith('MCP config could not be read for claude:')),
+      `errors should name the config failure, got: ${JSON.stringify(report.errors)}`
+    )
+  })
+
+  it('reports configured bundle servers as unverified (not reachable) for a skills-only native plugin', async () => {
+    // Config presence is not a connection test: found bundle servers stay
+    // unverified and the report never claims healthy from presence alone.
+    const { doctor } = await import('../../src/index.js')
+    seedCredentials()
+    const bundlePath = writeBundle(createBundle())
+    mkdirSync(join(tmpDir, '.claude', 'plugins'), { recursive: true })
+    writeFileSync(join(tmpDir, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+      version: 2,
+      plugins: { 'nsolid-skills-plugin@nodesource': [{ scope: 'user' }] },
+    }))
+    writeFileSync(join(tmpDir, '.claude.json'), JSON.stringify({
+      mcpServers: { 'ns-test-mcp': { type: 'http', url: 'https://mcp.example.com', headers: {} } },
+    }))
+
+    const report = await doctor('claude', bundlePath)
+
+    assert.strictEqual(report.mcpServers.status, 'unverified')
+    assert.ok(report.mcpServers.reachable.includes('ns-test-mcp'))
+    assert.notStrictEqual(report.healthy, true, 'presence is not a connection test')
+  })
+
+  it('green-lock: a legacy native plugin still reports MCP as ok without inspecting the config', async () => {
+    const { doctor } = await import('../../src/index.js')
+    seedCredentials()
+    seedMcpRemoteRuntime()
+    const bundlePath = writeBundle(createBundle())
+    mkdirSync(join(tmpDir, '.claude', 'plugins'), { recursive: true })
+    writeFileSync(join(tmpDir, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({
+      version: 2,
+      plugins: { 'nsolid-plugin@nodesource': [{ scope: 'user' }] },
+    }))
+
+    const report = await doctor('claude', bundlePath)
+
+    assert.strictEqual(report.healthy, true)
+    assert.strictEqual(report.mcpServers.status, 'ok')
+    assert.ok(report.mcpServers.reachable.includes('ns-test-mcp'))
+    assert.deepStrictEqual(report.errors, [])
   })
 })

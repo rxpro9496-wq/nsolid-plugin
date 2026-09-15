@@ -3,9 +3,19 @@ export { linkSkillsToHarness, unlinkSkillsFromHarness, getHarnessSkillsPath } fr
 export type { LinkResult, LinkStatus } from './skill-linker.js'
 export {
   readTrackingFile,
+  readTrackingFileStrict,
+  assertTrackingFileReadable,
   writeTrackingFile,
   addTrackedSkills,
   removeTrackedSkills,
   listTrackedSkills,
+  hasExternalMcpState,
 } from './skill-tracker.js'
-export type { SkillTrackingEntry, McpTrackingEntry, TrackingData } from './skill-tracker.js'
+export type {
+  SkillTrackingEntry,
+  McpTrackingEntry,
+  TrackingData,
+  ExternalMcpConnectionState,
+  ExternalMcpEntryRecord,
+  ExternalMcpHarnessRecord,
+} from './skill-tracker.js'

@@ -121,6 +121,93 @@ describe('removeNativePlugin', () => {
     assert.ok(manifest.imports.some((i: { name: string }) => i.name === 'unrelated-plugin'))
   })
 
+  it('agy fallback: leaves the real agy-written {"imports": null} manifest untouched', async () => {
+    const { getAdapter } = await import('../../../src/harnesses/index.js')
+    const { removeNativePlugin } = await import('../../../src/harnesses/native-plugin-uninstaller.js')
+    const { resolveHome } = await import('../../../src/utils/path.js')
+
+    const manifestPath = resolveHome('~/.gemini/config/import_manifest.json')
+    mkdirSync(dirname(manifestPath), { recursive: true })
+    const manifestBytes = JSON.stringify({ imports: null }, null, 2)
+    writeFileSync(manifestPath, manifestBytes)
+
+    const adapter = getAdapter('antigravity')
+    const result = await removeNativePlugin('antigravity', adapter, { runCli: binaryMissing })
+
+    assert.strictEqual(result.removed, true, 'nothing to remove is an idempotent success')
+    assert.deepStrictEqual(result.warnings, [])
+    assert.strictEqual(readFileSync(manifestPath, 'utf8'), manifestBytes, 'manifest untouched')
+  })
+
+  it('antigravity fallback: no spurious warning when the import manifest is a 0-byte file', async () => {
+    const { getAdapter } = await import('../../../src/harnesses/index.js')
+    const { removeNativePlugin } = await import('../../../src/harnesses/native-plugin-uninstaller.js')
+    const { resolveHome } = await import('../../../src/utils/path.js')
+
+    const pluginDir = resolveHome('~/.gemini/config/plugins/nsolid-plugin')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'plugin.json'), '{"name":"nsolid-plugin"}')
+
+    const manifestPath = resolveHome('~/.gemini/config/import_manifest.json')
+    mkdirSync(dirname(manifestPath), { recursive: true })
+    writeFileSync(manifestPath, '')
+
+    const adapter = getAdapter('antigravity')
+    const result = await removeNativePlugin('antigravity', adapter, { runCli: binaryMissing })
+
+    assert.strictEqual(result.removed, true)
+    assert.deepStrictEqual(result.warnings, [], 'a valid-empty manifest must not produce a warning')
+    assert.strictEqual(existsSync(pluginDir), false)
+    assert.strictEqual(readFileSync(manifestPath, 'utf8'), '', 'empty manifest bytes preserved')
+  })
+
+  it('antigravity fallback: removes the staged dir and preserves the real {"imports": null} manifest', async () => {
+    const { getAdapter } = await import('../../../src/harnesses/index.js')
+    const { removeNativePlugin } = await import('../../../src/harnesses/native-plugin-uninstaller.js')
+    const { resolveHome } = await import('../../../src/utils/path.js')
+
+    const pluginDir = resolveHome('~/.gemini/config/plugins/nsolid-plugin')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'plugin.json'), '{"name":"nsolid-plugin"}')
+
+    const manifestPath = resolveHome('~/.gemini/config/import_manifest.json')
+    mkdirSync(dirname(manifestPath), { recursive: true })
+    const manifestBytes = JSON.stringify({ imports: null }, null, 2)
+    writeFileSync(manifestPath, manifestBytes)
+
+    const adapter = getAdapter('antigravity')
+    const result = await removeNativePlugin('antigravity', adapter, { runCli: binaryMissing })
+
+    assert.strictEqual(result.removed, true)
+    assert.deepStrictEqual(result.warnings, [])
+    assert.strictEqual(existsSync(pluginDir), false, 'staged dir removed')
+    assert.strictEqual(readFileSync(manifestPath, 'utf8'), manifestBytes, 'real agy-written manifest untouched')
+  })
+
+  it('claude fallback: no spurious warning when ~/.claude.json is a 0-byte file', async () => {
+    const { getAdapter } = await import('../../../src/harnesses/index.js')
+    const { removeNativePlugin } = await import('../../../src/harnesses/native-plugin-uninstaller.js')
+    const { resolveHome } = await import('../../../src/utils/path.js')
+
+    const installedPath = resolveHome('~/.claude/plugins/installed_plugins.json')
+    mkdirSync(dirname(installedPath), { recursive: true })
+    writeFileSync(installedPath, JSON.stringify({
+      version: 2,
+      plugins: { 'nsolid-plugin@nodesource': [{ scope: 'user' }] },
+    }, null, 2))
+
+    const claudeJsonPath = resolveHome('~/.claude.json')
+    writeFileSync(claudeJsonPath, '')
+
+    const adapter = getAdapter('claude')
+    const result = await removeNativePlugin('claude', adapter, { runCli: binaryMissing })
+
+    assert.strictEqual(result.removed, true)
+    assert.deepStrictEqual(result.warnings, [], 'a valid-empty enable-map file must not produce a warning')
+    const remaining = JSON.parse(readFileSync(installedPath, 'utf-8'))
+    assert.ok(!('nsolid-plugin@nodesource' in remaining.plugins), 'id still removed from the registry')
+  })
+
   it('codex fallback: removes the plugin table from config.toml', async () => {
     const { getAdapter } = await import('../../../src/harnesses/index.js')
     const { removeNativePlugin } = await import('../../../src/harnesses/native-plugin-uninstaller.js')

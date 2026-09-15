@@ -51,4 +51,17 @@ describe('CLI help', () => {
     assert.match(result.stdout, /--accounts-url <url>\s+Explicit origin-only accounts URL override for setup\/switch-org/, 'help must scope --accounts-url to setup/switch-org')
     assert.match(result.stdout, /--quiet\s+Suppress step-by-step progress output \(setup\/install\/switch-org\)/, 'help must scope --quiet to setup/install/switch-org')
   })
+
+  it('documents the experimental --external-mcp flag and its setup/switch-org/uninstall scope', () => {
+    const result = spawnSync(process.execPath, ['--import', 'tsx/esm', CLI_PATH, '--help'], {
+      encoding: 'utf-8',
+    })
+
+    assert.strictEqual(result.status, 0, `CLI --help failed: ${result.stderr}`)
+    assert.match(
+      result.stdout,
+      /--external-mcp\s+Experimental \(setup\/switch-org\/uninstall, claude\/codex\/antigravity only\): setup\/switch-org authenticate and write direct HTTP MCP config without preparing the mcp-remote bridge runtime or copying\/linking skills\. uninstall always performs the complete selected-harness cleanup \(skills, MCP entries, native plugin, marketplace registration\); the flag is accepted but does not narrow it\./,
+      'help must document the experimental flag with its exact scope and effects'
+    )
+  })
 })

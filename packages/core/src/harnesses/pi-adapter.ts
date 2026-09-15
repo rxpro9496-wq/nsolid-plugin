@@ -31,9 +31,19 @@ export class PiAdapter implements HarnessAdapter {
    * Pi is package-owned: detection follows from an installed
    * `nsolid-pi-plugin` npm package (see pi-plugin-detector). There is no
    * separate enable flag, so `installed` implies `enabled`.
+   *
+   * `installedIds` mirrors the Antigravity adapter contract (concrete base
+   * names): the plugin registry's generic inspection branch reads ids only,
+   * so a package-backed install must surface them or uninstall reports
+   * verified absence while the plugin is still on disk.
    */
   detectNativePlugin (): NativePluginStatus {
     const installed = piPluginInstalled()
-    return { installed, enabled: installed ? true : undefined, label: PI_PLUGIN_PACKAGE_NAME }
+    return {
+      installed,
+      enabled: installed ? true : undefined,
+      installedIds: installed ? [PI_PLUGIN_PACKAGE_NAME] : [],
+      label: PI_PLUGIN_PACKAGE_NAME,
+    }
   }
 }

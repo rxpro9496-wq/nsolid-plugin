@@ -101,3 +101,73 @@ describe('PiAdapter', () => {
     assert.strictEqual(adapter.name, 'pi')
   })
 })
+
+describe('PiAdapter.detectNativePlugin', () => {
+  let tmpDir: string
+  let originalHome: string | undefined
+  let originalUserProfile: string | undefined
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'nsolid-test-'))
+    originalHome = process.env.HOME
+    originalUserProfile = process.env.USERPROFILE
+    process.env.HOME = tmpDir
+    process.env.USERPROFILE = tmpDir
+  })
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true })
+    if (originalHome !== undefined) {
+      process.env.HOME = originalHome
+    } else {
+      delete process.env.HOME
+    }
+    if (originalUserProfile !== undefined) {
+      process.env.USERPROFILE = originalUserProfile
+    } else {
+      delete process.env.USERPROFILE
+    }
+  })
+
+  /** Mirror how `pi install npm:nsolid-pi-plugin` records a package-backed plugin. */
+  function seedPiPlugin (): void {
+    const packageRoot = join(tmpDir, 'pi-package')
+    mkdirSync(packageRoot, { recursive: true })
+    writeFileSync(join(packageRoot, 'package.json'), JSON.stringify({ name: 'nsolid-pi-plugin', version: '1.0.0' }))
+    mkdirSync(join(tmpDir, '.pi', 'agent'), { recursive: true })
+    writeFileSync(join(tmpDir, '.pi', 'agent', 'settings.json'), JSON.stringify({ packages: [packageRoot] }))
+  }
+
+  it('surfaces concrete installed ids when the nsolid-pi-plugin package is installed', async () => {
+    seedPiPlugin()
+    const { PiAdapter } = await import('../../../src/harnesses/pi-adapter.js')
+    const adapter = new PiAdapter()
+
+    const status = adapter.detectNativePlugin()
+    assert.strictEqual(status.installed, true)
+    assert.strictEqual(status.enabled, true)
+    assert.deepStrictEqual(status.installedIds, ['nsolid-pi-plugin'])
+    assert.strictEqual(status.label, 'nsolid-pi-plugin')
+  })
+
+  it('reports an empty id set when the package is not installed', async () => {
+    const { PiAdapter } = await import('../../../src/harnesses/pi-adapter.js')
+    const adapter = new PiAdapter()
+
+    const status = adapter.detectNativePlugin()
+    assert.strictEqual(status.installed, false)
+    assert.deepStrictEqual(status.installedIds, [])
+  })
+
+  it('feeds the plugin registry inspection so uninstall never sees verified absence for an installed package', async () => {
+    seedPiPlugin()
+    const { PiAdapter } = await import('../../../src/harnesses/pi-adapter.js')
+    const { inspectNativeInstallation } = await import('../../../src/harnesses/plugin-registry.js')
+    const adapter = new PiAdapter()
+
+    const inspection = inspectNativeInstallation('pi', adapter)
+    assert.deepStrictEqual(inspection.pluginIds, ['nsolid-pi-plugin'])
+    assert.strictEqual(inspection.installedPluginIds.includes('nsolid-pi-plugin'), true)
+    assert.strictEqual(inspection.supportsMarketplaceRemove, false)
+  })
+})

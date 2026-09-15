@@ -203,5 +203,20 @@ describe('AntigravityAdapter', () => {
 
       assert.strictEqual(status.installed, false)
     })
+
+    it('treats the real agy-written {"imports": null} manifest as empty', async () => {
+      const { AntigravityAdapter } = await import('../../../src/harnesses/antigravity-adapter.js')
+      const { resolveHome } = await import('../../../src/utils/path.js')
+
+      const manifestPath = resolveHome('~/.gemini/config/import_manifest.json')
+      mkdirSync(dirname(manifestPath), { recursive: true })
+      writeFileSync(manifestPath, JSON.stringify({ imports: null }, null, 2))
+
+      const adapter = new AntigravityAdapter()
+      const status = adapter.detectNativePlugin()
+
+      assert.strictEqual(status.installed, false)
+      assert.strictEqual(status.installedIds, undefined)
+    })
   })
 })

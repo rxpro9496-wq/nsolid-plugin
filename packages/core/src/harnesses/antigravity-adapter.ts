@@ -5,8 +5,8 @@ import type { HarnessType } from '../types.js'
 import { resolveHome } from '../utils/path.js'
 import { writeAdapterMcpConfig, readExistingConfig } from '../mcp/mcp-config-writer.js'
 import { readJsonFile } from '../utils/config.js'
+import { PLUGIN_BASE_NAMES, PLUGIN_BASE_NAME } from './plugin-name.js'
 
-const PLUGIN_NAME = 'nsolid-plugin'
 const IMPORT_MANIFEST_REL = '~/.gemini/config/import_manifest.json'
 
 export class AntigravityAdapter implements HarnessAdapter {
@@ -62,27 +62,30 @@ export class AntigravityAdapter implements HarnessAdapter {
    * plugin being present.
    */
   detectNativePlugin (): NativePluginStatus {
-    const status: NativePluginStatus = { installed: false, label: PLUGIN_NAME }
-    const staged = path.join(this.getPluginsPath(), PLUGIN_NAME)
-    if (existsSync(staged)) {
-      status.installed = true
-      status.enabled = true
-      status.installedIds = [PLUGIN_NAME]
-      return status
+    const status: NativePluginStatus = { installed: false, label: PLUGIN_BASE_NAME }
+    const matched: string[] = []
+    for (const base of PLUGIN_BASE_NAMES) {
+      if (existsSync(path.join(this.getPluginsPath(), base))) matched.push(base)
     }
 
     // Fall back to the import manifest: the staged directory may have been
     // removed out of band while the manifest entry remains (or vice versa).
     try {
       const manifest = readJsonFile<{ imports?: Array<{ name?: string }> }>(resolveHome(IMPORT_MANIFEST_REL))
-      const recorded = manifest?.imports?.some((entry) => entry?.name === PLUGIN_NAME) ?? false
-      if (recorded) {
-        status.installed = true
-        status.enabled = true
-        status.installedIds = [PLUGIN_NAME]
+      for (const entry of manifest?.imports ?? []) {
+        if (entry?.name && (PLUGIN_BASE_NAMES as readonly string[]).includes(entry.name) && !matched.includes(entry.name)) {
+          matched.push(entry.name)
+        }
       }
     } catch {
       // Corrupt or unreadable manifest — fall through (detection is best-effort).
+    }
+
+    if (matched.length > 0) {
+      status.installed = true
+      status.enabled = true
+      status.installedIds = matched
+      status.label = matched[0]
     }
     return status
   }

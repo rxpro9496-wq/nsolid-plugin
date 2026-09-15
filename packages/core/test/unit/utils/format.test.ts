@@ -1,5 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
+import { stripVTControlCharacters } from 'node:util'
 import type { DoctorReport } from '../../../src/types.js'
 
 function makeReport (overrides?: Partial<DoctorReport>): DoctorReport {
@@ -45,6 +46,33 @@ describe('formatDoctorReport', () => {
     assert.ok(out.includes('Skills        ✓ ok'))
     assert.ok(out.includes('MCP servers   ✓ ok'))
     assert.ok(out.includes('✓ All checks passed'))
+  })
+
+  it('renders an active external-MCP report as unverified, not missing (with and without color)', async () => {
+    const { formatDoctorReport } = await import('../../../src/utils/format.js')
+    const report = makeReport({
+      healthy: false,
+      skills: { status: 'unverified', installed: [], missing: [] },
+      mcpServers: { status: 'unverified', reachable: [], unreachable: [] },
+      externalMcp: {
+        status: 'unverified',
+        reason: 'External MCP mode: direct HTTP config is present, but doctor does not probe endpoint reachability or authentication and does not verify external package skills.',
+        configured: ['nsolid-console', 'ncm'],
+        checks: { authentication: 'unverified', skills: 'unverified', remoteReachability: 'unverified' },
+      },
+    })
+    for (const color of [false, true]) {
+      const out = formatDoctorReport(report, 'claude', color)
+      const plainOut = stripVTControlCharacters(out)
+
+      assert.ok(plainOut.includes('Skills        ? unverified'), `color=${color}`)
+      assert.ok(plainOut.includes('MCP servers   ? configured, not probed (nsolid-console, ncm)'), `color=${color}`)
+      assert.ok(plainOut.includes('External MCP  ? unverified'), `color=${color}`)
+      assert.ok(plainOut.includes('direct config found; reachability and authentication were not probed'), `color=${color}`)
+      assert.ok(plainOut.includes('Verification incomplete'), `color=${color}`)
+      assert.ok(!plainOut.includes('✗ missing'), `color=${color}: unverified must not render as missing`)
+      assert.ok(!plainOut.includes('✗ Problems found'), `color=${color}: unverified alone is not rendered as broken`)
+    }
   })
 
   it('shows "✗ missing" on missing credentials (no color)', async () => {
@@ -298,6 +326,130 @@ describe('formatDoctorReport', () => {
   })
 })
 
+describe('formatDoctorReport — MCP unverified text/JSON coherence', () => {
+  it('skills-only unverified with one inspected server lists it instead of "none found" (with and without color)', async () => {
+    const { formatDoctorReport } = await import('../../../src/utils/format.js')
+    // Skills-only native plugin: doctor inspected the harness MCP config and
+    // found the bundle server configured-but-not-probed. No externalMcp field.
+    const report = makeReport({
+      healthy: false,
+      plugin: { status: 'ok', installed: true, label: 'nsolid-skills-plugin@nodesource' },
+      mcpServers: { status: 'unverified', reachable: ['nsolid-console'], unreachable: [] },
+    })
+    for (const color of [false, true]) {
+      const out = formatDoctorReport(report, 'claude', color)
+      const plainOut = stripVTControlCharacters(out)
+
+      assert.ok(plainOut.includes('MCP servers   ? configured, not probed (nsolid-console)'), `color=${color}`)
+      assert.ok(!plainOut.includes('none found'), `color=${color}: text must not contradict the JSON inspected list`)
+      assert.ok(!plainOut.includes('MCP servers   ✓ ok'), `color=${color}: unverified must never render as healthy`)
+      assert.ok(!plainOut.includes('reachable)'), `color=${color}: unverified must not claim tested connectivity`)
+      assert.ok(!plainOut.includes('✓ All checks passed'), `color=${color}`)
+    }
+  })
+
+  it('skills-only unverified with several inspected servers lists all of them (no color and color)', async () => {
+    const { formatDoctorReport } = await import('../../../src/utils/format.js')
+    const reachable = ['nsolid-console', 'ns-benchmark', 'ncm']
+    for (const color of [false, true]) {
+      const report = makeReport({
+        healthy: false,
+        mcpServers: { status: 'unverified', reachable, unreachable: [] },
+      })
+      const out = formatDoctorReport(report, 'pi', color)
+
+      assert.ok(out.includes('configured, not probed (nsolid-console, ns-benchmark, ncm)'), `color=${color}`)
+      assert.ok(!out.includes('none found'), `color=${color}`)
+      // Text stays coherent with the JSON inspected list.
+      for (const name of reachable) {
+        assert.ok(out.includes(name), `server ${name} must appear in text (color=${color})`)
+      }
+    }
+  })
+
+  it('skills-only unverified with no inspected servers keeps the "none found" fallback (no color and color)', async () => {
+    const { formatDoctorReport } = await import('../../../src/utils/format.js')
+    for (const color of [false, true]) {
+      const report = makeReport({
+        healthy: false,
+        mcpServers: { status: 'unverified', reachable: [], unreachable: [] },
+      })
+      const out = formatDoctorReport(report, 'claude', color)
+
+      assert.ok(out.includes('configured, not probed (none found)'), `color=${color}`)
+    }
+  })
+
+  it('skills-only unverified with partial configuration lists configured servers and names the unconfigured ones (no color and color)', async () => {
+    const { formatDoctorReport } = await import('../../../src/utils/format.js')
+    for (const color of [false, true]) {
+      const report = makeReport({
+        healthy: false,
+        mcpServers: { status: 'unverified', reachable: ['nsolid-console'], unreachable: ['ns-benchmark'] },
+      })
+      const out = formatDoctorReport(report, 'claude', color)
+
+      assert.ok(out.includes('configured, not probed (nsolid-console)'), `color=${color}`)
+      assert.ok(out.includes('not configured: ns-benchmark'), `color=${color}`)
+      assert.ok(!out.includes('none found'), `color=${color}`)
+      // No mixing of the two states inside one list.
+      assert.ok(!out.includes('(nsolid-console, ns-benchmark)'), `color=${color}`)
+    }
+  })
+
+  it('skills-only config read error renders the unreachable status with the error bullet (no color and color)', async () => {
+    const { formatDoctorReport } = await import('../../../src/utils/format.js')
+    for (const color of [false, true]) {
+      const report = makeReport({
+        healthy: false,
+        mcpServers: { status: 'unreachable', reachable: [], unreachable: [] },
+        errors: ['MCP config could not be read for pi: EACCES'],
+      })
+      const out = formatDoctorReport(report, 'pi', color)
+
+      assert.ok(out.includes('✗ unreachable'), `color=${color}`)
+      assert.ok(out.includes('MCP config could not be read for pi: EACCES'), `color=${color}`)
+      assert.ok(!out.includes('configured, not probed'), `color=${color}`)
+    }
+  })
+
+  it('external-active mode with a config error keeps "none found" on the MCP line while the External MCP line reports the error', async () => {
+    const { formatDoctorReport } = await import('../../../src/utils/format.js')
+    const report = makeReport({
+      healthy: false,
+      skills: { status: 'unverified', installed: [], missing: [] },
+      mcpServers: { status: 'unverified', reachable: [], unreachable: [] },
+      externalMcp: {
+        status: 'unverified',
+        reason: 'External MCP mode.',
+        configured: [],
+        checks: { authentication: 'unverified', skills: 'unverified', remoteReachability: 'unverified' },
+        configError: 'Failed to parse ~/.claude.json: Unexpected token',
+      },
+      errors: ['MCP config could not be read for claude'],
+    })
+    const out = formatDoctorReport(report, 'claude', false)
+
+    assert.ok(out.includes('configured, not probed (none found)'), 'nothing could be inspected, so none found is honest')
+    assert.ok(out.includes('External MCP  ? unverified'))
+    assert.ok(out.includes('config error: Failed to parse ~/.claude.json: Unexpected token'))
+    assert.ok(out.includes('✗ Problems found'))
+  })
+
+  it('legacy native plugin mode renders reachable servers as ok (no color and color)', async () => {
+    const { formatDoctorReport } = await import('../../../src/utils/format.js')
+    for (const color of [false, true]) {
+      const report = makeReport({
+        mcpServers: { status: 'ok', reachable: ['nsolid-console', 'ns-benchmark'], unreachable: [] },
+      })
+      const out = formatDoctorReport(report, 'claude', color)
+
+      assert.ok(out.includes('✓ ok (2 reachable)'), `color=${color}`)
+      assert.ok(!out.includes('configured, not probed'), `color=${color}`)
+    }
+  })
+})
+
 describe('formatSwitchOrgGuidance', () => {
   it('tells a native-only plugin-owned harness to reconnect', async () => {
     const { formatSwitchOrgGuidance } = await import('../../../src/utils/format.js')
@@ -368,6 +520,24 @@ describe('formatSwitchOrgGuidance', () => {
 
     assert.ok(lines.some((l) => l.includes('Reconnect') && l.includes('OpenCode')))
     assert.ok(!lines.some((l) => l.includes('fallback direct install')))
+  })
+
+  it('external mode: reconnects the direct config and points at flag-scoped refreshes, never the old plugin or install', async () => {
+    const { formatSwitchOrgGuidance } = await import('../../../src/utils/format.js')
+    const lines = formatSwitchOrgGuidance({
+      harness: 'claude',
+      harnessLabel: 'Claude Code',
+      isPluginOwned: true,
+      nativeInstalled: false,
+      fallbackTracked: false,
+      externalMcp: true,
+    }, false)
+
+    assert.ok(lines.some((l) => l.includes('Reconnect') && l.includes('Claude Code')), 'must tell the user to reconnect the direct-config harness')
+    assert.ok(lines.some((l) => l.includes('--external-mcp') && l.includes('setup --harness <harness>')), 'must show the flag-scoped refresh command for other harnesses')
+    assert.ok(!lines.some((l) => l.includes('fallback direct install')), 'must not recommend the fallback installer')
+    assert.ok(!lines.some((l) => l.includes('nsolid-plugin install --harness')), 'must not recommend an install that cannot carry the flag')
+    assert.ok(!lines.some((l) => l.includes('native plugin')), 'must not recommend the old native plugin')
   })
 })
 
@@ -471,6 +641,28 @@ describe('buildSwitchOrgOutcome', () => {
     assert.match(outcome.stateLine, /Now signed in to org: org-456/)
     assert.strictEqual(outcome.warning, null)
     assert.deepStrictEqual(outcome.commands, [])
+  })
+
+  it('external mode: partial retry command carries --external-mcp and never suggests the flagless install/setup', async () => {
+    const { buildSwitchOrgOutcome } = await import('../../../src/utils/format.js')
+    const outcome = buildSwitchOrgOutcome({
+      success: false,
+      authSucceeded: true,
+      errors: ['MCP configuration failed: .claude.json'],
+      previousOrg: 'org-original',
+      currentOrg: 'org-456',
+      harness: 'claude',
+      harnessLabel: 'Claude Code',
+      isPluginOwned: true,
+      externalMcp: true,
+    })
+
+    assert.strictEqual(outcome.kind, 'partial')
+    assert.strictEqual(outcome.exitCode, 1, 'incomplete refresh must still exit nonzero')
+    assert.match(outcome.stateLine, /Now signed in to org: org-456/)
+    assert.deepStrictEqual(outcome.commands, ['nsolid-plugin setup --harness claude --external-mcp'])
+    assert.ok(!outcome.commands.some((c) => c.startsWith('nsolid-plugin install')), 'install cannot carry the flag and must not be suggested')
+    assert.ok(!outcome.commands.some((c) => c.includes('setup --harness claude)') && !c.includes('--external-mcp')), 'the flagless setup retry must not be suggested')
   })
 })
 

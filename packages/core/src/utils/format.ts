@@ -57,14 +57,34 @@ function skillsLine (s: DoctorReport['skills'], color: boolean): string {
   if (s.status === 'ok') return line('Skills', `✓ ok (${s.installed.length} installed)`, C.green, '', color)
   if (s.status === 'partial') return line('Skills', `⚠ partial (${s.installed.length} installed, ${s.missing.length} missing)`, C.yellow, 'Re-run installation to restore skills', color)
   if (s.status === 'missing') return line('Skills', `✗ missing (${s.missing.length} missing)`, C.red, 'Re-run installation to restore skills', color)
+  if (s.status === 'unverified') return line('Skills', '? unverified', C.dim, 'external MCP mode: not checked here', color)
   return line('Skills', '? unknown', C.dim, '', color)
 }
 
-function mcpLine (m: DoctorReport['mcpServers'], color: boolean): string {
+function mcpLine (m: DoctorReport['mcpServers'], color: boolean, configured: string[] = []): string {
   if (m.status === 'ok') return line('MCP servers', `✓ ok (${m.reachable.length} reachable)`, C.green, '', color)
   if (m.status === 'partial') return line('MCP servers', `⚠ partial (${m.reachable.length} reachable, ${m.unreachable.length} unreachable)`, C.yellow, 'Check network connectivity or MCP server status', color)
   if (m.status === 'unreachable') return line('MCP servers', `✗ unreachable (${m.unreachable.length} unreachable)`, C.red, 'Check network connectivity or MCP server status', color)
+  if (m.status === 'unverified') {
+    // Inspected names stay "configured, not probed" — never a health or
+    // connectivity claim. "(none found)" is only honest when the mode's
+    // inspected list is genuinely empty.
+    const detail = configured.length > 0 ? `configured, not probed (${configured.join(', ')})` : 'configured, not probed (none found)'
+    // Skills-only/native inspection can also find bundle servers that are NOT
+    // in the harness config; name them so the text agrees with the JSON
+    // without mixing configured and unconfigured servers into one list.
+    // External mode never populates `unreachable`, so this cannot fire there.
+    const notConfigured = m.unreachable.length > 0 ? `; not configured: ${m.unreachable.join(', ')}` : ''
+    return line('MCP servers', `? ${detail}${notConfigured}`, C.dim, '', color)
+  }
   return line('MCP servers', '? unknown', C.dim, '', color)
+}
+
+function externalMcpLine (e: NonNullable<DoctorReport['externalMcp']>, color: boolean): string {
+  const detail = e.configError
+    ? `config error: ${e.configError}`
+    : 'direct config found; reachability and authentication were not probed'
+  return line('External MCP', '? unverified', C.dim, detail, color)
 }
 
 function bridgeLine (b: NonNullable<DoctorReport['bridge']>, harness: string, color: boolean): string {
@@ -92,7 +112,19 @@ export function formatDoctorReport (report: DoctorReport, harness: HarnessType, 
   const plugin = pluginLine(report.plugin, harness, color)
   if (plugin) out.push(plugin)
   out.push(skillsLine(report.skills, color))
-  out.push(mcpLine(report.mcpServers, color))
+  // The 'unverified' MCP line must name the servers doctor actually inspected,
+  // and the authoritative source differs by inspection mode: external-active
+  // mode records them in externalMcp.configured (mcpServers.reachable is
+  // deliberately empty there — config presence was never probed), while
+  // skills-only/native inspection records the names found in the harness
+  // config in mcpServers.reachable. Feeding the external list into a
+  // skills-only report made the text claim "(none found)" while the JSON
+  // listed the inspected servers.
+  const inspected = report.externalMcp === undefined && report.mcpServers.status === 'unverified'
+    ? report.mcpServers.reachable
+    : (report.externalMcp?.configured ?? [])
+  out.push(mcpLine(report.mcpServers, color, inspected))
+  if (report.externalMcp) out.push(externalMcpLine(report.externalMcp, color))
   if (report.bridge) out.push(bridgeLine(report.bridge, harness, color))
 
   if (harness === 'pi' && report.mcpServers.status !== 'unknown' && report.mcpServers.reachable.length > 0) {
@@ -103,7 +135,10 @@ export function formatDoctorReport (report: DoctorReport, harness: HarnessType, 
   for (const e of report.errors) out.push((color ? C.yellow('  • ' + e) : '  • ' + e))
   out.push('')
   if (report.healthy) out.push(color ? C.green('✓ All checks passed') : '✓ All checks passed')
-  else out.push(color ? C.red('✗ Problems found') : '✗ Problems found')
+  else if (report.externalMcp && report.errors.length === 0) {
+    const note = '? Verification incomplete — external MCP config is present but not connection-tested'
+    out.push(color ? C.yellow(note) : note)
+  } else out.push(color ? C.red('✗ Problems found') : '✗ Problems found')
   return out.join('\n')
 }
 
@@ -126,6 +161,15 @@ export interface SwitchOrgGuidanceInput {
    * checked and reported on independently, not as an either/or.
    */
   fallbackTracked: boolean;
+  /**
+   * True when the switch ran in the experimental `--external-mcp` mode: the
+   * selected harness's direct HTTP config was (or should have been) refreshed
+   * on disk, so guidance is reconnect-only — never a recommendation of the
+   * old native plugin or an unnecessary skill installation — plus a reminder
+   * that other --external-mcp harnesses keep the previous org until each is
+   * refreshed explicitly with the flag.
+   */
+  externalMcp?: boolean;
 }
 
 /**
@@ -137,10 +181,21 @@ export interface SwitchOrgGuidanceInput {
  * whether a native plugin is ALSO installed for the same harness.
  */
 export function formatSwitchOrgGuidance (input: SwitchOrgGuidanceInput, color: boolean): string[] {
-  const { harness, harnessLabel, isPluginOwned, nativeInstalled, fallbackTracked } = input
+  const { harness, harnessLabel, isPluginOwned, nativeInstalled, fallbackTracked, externalMcp } = input
   const dim = (s: string) => color ? C.dim(s) : s
   const yellow = (s: string) => color ? C.yellow(s) : s
   const lines: string[] = []
+
+  // Experimental --external-mcp mode: the selected harness holds a direct
+  // HTTP config on disk. Reconnect guidance only — never point at the old
+  // plugin or a skill installation, and remind the user that other
+  // --external-mcp harnesses keep the previous org until refreshed.
+  if (externalMcp === true) {
+    lines.push(`  ${dim('Reconnect:')} restart/reconnect ${harnessLabel} so it reloads the refreshed direct MCP config from disk.`)
+    lines.push(`  ${yellow('⚠ Other harnesses configured with --external-mcp keep the previous org baked into their MCP config.')}`)
+    lines.push(`  ${yellow('  Refresh each explicitly: nsolid-plugin setup --harness <harness> --external-mcp')}`)
+    return lines
+  }
 
   if (!isPluginOwned) {
     lines.push(`  ${dim('Reconnect:')} restart/reconnect ${harnessLabel} so it reloads the refreshed MCP config from disk.`)
@@ -181,6 +236,14 @@ export interface SwitchOrgOutcomeInput {
   harness: string
   harnessLabel: string
   isPluginOwned: boolean
+  /**
+   * True when the switch ran in the experimental `--external-mcp` mode. The
+   * selected harness's direct HTTP config refresh must then be retried with
+   * `setup --external-mcp` (the public `install` command has no such flag),
+   * and success guidance describes a direct-config harness, not the old
+   * native plugin.
+   */
+  externalMcp?: boolean
 }
 
 export type SwitchOrgOutcomeKind = 'auth-failed' | 'partial' | 'success'
@@ -212,7 +275,7 @@ export interface SwitchOrgOutcome {
 }
 
 export function buildSwitchOrgOutcome (input: SwitchOrgOutcomeInput): SwitchOrgOutcome {
-  const { success, authSucceeded, errors, previousOrg, currentOrg, harness, harnessLabel, isPluginOwned } = input
+  const { success, authSucceeded, errors, previousOrg, currentOrg, harness, harnessLabel, isPluginOwned, externalMcp } = input
   const org = currentOrg ?? '(unknown)'
   const orgChanged = currentOrg !== previousOrg
   const stateLine = `${orgChanged ? '✓ Now signed in to org' : '✓ Still signed in to org'}: ${org}`
@@ -240,8 +303,13 @@ export function buildSwitchOrgOutcome (input: SwitchOrgOutcomeInput): SwitchOrgO
     // Org switched (credentials live on disk) but the harness's direct MCP
     // config could not be refreshed. Partial success: report it accurately,
     // show the active org + retry command, and still exit nonzero.
-    const commands = [`nsolid-plugin install --harness ${harness}`]
-    if (!isPluginOwned) commands.push(`(or re-run: nsolid-plugin setup --harness ${harness})`)
+    // In experimental --external-mcp mode the retry must also carry the flag:
+    // `install` does not accept it, and an unflagged setup would provision
+    // the bridge runtime instead of rewriting the direct HTTP config.
+    const commands = externalMcp === true
+      ? [`nsolid-plugin setup --harness ${harness} --external-mcp`]
+      : [`nsolid-plugin install --harness ${harness}`]
+    if (!isPluginOwned && externalMcp !== true) commands.push(`(or re-run: nsolid-plugin setup --harness ${harness})`)
     return {
       kind: 'partial',
       exitCode: 1,

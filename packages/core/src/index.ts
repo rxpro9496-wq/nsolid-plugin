@@ -3,7 +3,6 @@ export type { HarnessAdapter, McpConfig, McpServerConfig } from './harnesses/ind
 export { loadCredentials, isExpired } from './auth/index.js'
 
 import path from 'node:path'
-import { readdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 
 import type {
@@ -17,38 +16,36 @@ import type {
   Credentials,
   Logger,
 } from './types.js'
-import { PLUGIN_OWNED_HARNESSES, NATIVE_PLUGIN_HARNESSES } from './types.js'
+import { PLUGIN_OWNED_HARNESSES, NATIVE_PLUGIN_HARNESSES, EXTERNAL_MCP_HARNESSES } from './types.js'
 import { validateBundle } from './validate.js'
 import { ensureAuthenticated, loadCredentials, isExpired, removeCredentials } from './auth/index.js'
 import { resolveMcpUrl } from './auth/mcp-url.js'
-import { installSkills, installSkillsToDirectory, uninstallSkills, SkillCopyError } from './skills/skill-copier.js'
-import { linkSkillsToHarness, unlinkSkillsFromHarness } from './skills/skill-linker.js'
+import { installSkills, installSkillsToDirectory, SkillCopyError } from './skills/skill-copier.js'
+import { linkSkillsToHarness } from './skills/skill-linker.js'
 import {
   readTrackingFile,
+  assertTrackingFileReadable,
   addTrackedSkills,
-  removeTrackedSkills,
 } from './skills/skill-tracker.js'
 import {
   writeMcpConfig,
-  removeMcpConfig,
   addTrackedMcps,
-  removeTrackedMcps,
   listTrackedMcps,
   ensureMcpRemoteRuntime,
   inspectMcpRemoteRuntime,
+  assertNoActiveExternalMcp,
+  clearDisconnectedExternalMcp,
+  recordExternalMcpOwnership,
 } from './mcp/index.js'
 import { getAdapter } from './harnesses/index.js'
-import type { HarnessAdapter } from './harnesses/index.js'
-import { removeNativePlugin } from './harnesses/native-plugin-uninstaller.js'
+import { legacyNsolidPluginIds } from './harnesses/plugin-name.js'
 import { findPiPluginSkillRoots } from './harnesses/pi-plugin-detector.js'
 import { readJsonFile } from './utils/config.js'
 import { getSkillsDir, getAuthFilePath } from './utils/path.js'
 import { createLogger, isVerboseEnabled } from './utils/logger.js'
 import { createConsoleProgress, silentProgress, type ProgressReporter } from './utils/progress.js'
 import { restoreConfigBackup, type BackupEntry } from './utils/backup.js'
-import { toPluginError } from './errors.js'
-
-const KNOWN_MCP_SERVERS = ['ns-benchmark', 'nsolid-console', 'ncm']
+import { toPluginError, PluginError } from './errors.js'
 
 function formatBundleSummary (bundle: BundleDescriptor, options: { packageOwnedSkills?: boolean }): string {
   if (options.packageOwnedSkills === true) {
@@ -116,6 +113,68 @@ export function resolveAccountsUrl (defaultUrl: string, logger?: Logger): string
   return url
 }
 
+/**
+ * Per-harness removal guidance for a detected legacy-plugin conflict. Names the
+ * EXACT detected legacy id and only that plugin's removal. It deliberately does
+ * NOT suggest a broad full `nsolid-plugin uninstall`: that would also delete
+ * the wanted skills-only plugin (`nsolid-skills-plugin`) and its marketplace
+ * registration. For Claude no copy-pastable command is printed because the
+ * preflight cannot attribute the install scope; a wrong `--scope` removal is
+ * never guessed.
+ */
+function legacyConflictRemovalAction (harness: HarnessType, legacyId: string): string {
+  const keep = 'Keep the nsolid-skills-plugin install and its marketplace: a full nsolid-plugin uninstall would delete both.'
+  const repeat = 'Then re-run setup --external-mcp. Disabling it is not sufficient: this guard checks installation, not enabled state.'
+  switch (harness) {
+    case 'codex':
+      return `Uninstall the old plugin first — remove only the legacy id: codex plugin remove ${legacyId}. ${keep} ${repeat}`
+    case 'antigravity':
+      return `Uninstall the old plugin first — remove only the legacy id: agy plugin uninstall ${legacyId}. ${keep} ${repeat}`
+    default:
+      return `Uninstall the old plugin first — remove only the legacy plugin "${legacyId}" with Claude's plugin manager, using the --scope where it is registered (this guard cannot attribute the scope, so no copy-paste command is printed). ${keep} ${repeat}`
+  }
+}
+
+/**
+ * Whole-command preflight for the experimental external setup path:
+ * unsupported harnesses and old-native-plugin conflicts are rejected for
+ * EVERY selected harness. setup() runs the same checks per harness for API
+ * callers; the CLI calls this once before its loop so a conflict on a later
+ * harness cannot leave earlier harnesses configured (multi-select T14).
+ *
+ * The MCP conflict is the LEGACY `nsolid-plugin` distribution only, selected
+ * over the complete detected id list: the skills-only plugin registers no MCP
+ * servers, so a skills-only native install (before or after external setup)
+ * is allowed. A mixed install still conflicts and is reported on the OLD id.
+ */
+export function assertExternalMcpSetupPreflight (harnesses: HarnessType[]): void {
+  for (const harness of harnesses) {
+    if (!EXTERNAL_MCP_HARNESSES.has(harness)) {
+      throw new PluginError(
+        'INVALID_OPTION',
+        `--external-mcp is only supported for harnesses: ${[...EXTERNAL_MCP_HARNESSES].join(', ')} (got: ${harness})`,
+        {
+          harness,
+          action: 'Re-run without --external-mcp, or target a supported harness.',
+        }
+      )
+    }
+    const native = getAdapter(harness).detectNativePlugin?.()
+    if (native?.installed !== true) continue
+    const legacyIds = legacyNsolidPluginIds(native)
+    if (legacyIds.length === 0) continue
+    const legacyId = legacyIds[0]
+    throw new PluginError(
+      'INVALID_OPTION',
+      `--external-mcp conflict: the old native N|Solid plugin is installed for ${harness} (${legacyId}) and registers the same MCP servers. This experimental mode must not create duplicate registrations.`,
+      {
+        harness,
+        action: legacyConflictRemovalAction(harness, legacyId),
+      }
+    )
+  }
+}
+
 export async function setup (options: SetupOptions): Promise<SetupResult> {
   const logger = options.logger ?? createLogger({ verbose: isVerboseEnabled(options.verbose) })
   const progress = options.progress ?? createConsoleProgress()
@@ -129,6 +188,28 @@ export async function setup (options: SetupOptions): Promise<SetupResult> {
   }
 
   logger.info('setup.start', { harness: options.harness, bundlePath: options.bundlePath })
+
+  // Tracked ownership evidence must be readable before any side effect
+  // (OAuth, config write, runtime, ownership record): a present-but-unreadable
+  // or malformed file is not a fresh install, and overwriting it would
+  // silently discard external-MCP records that guard destructive commands.
+  await assertTrackingFileReadable(logger)
+
+  // Flagless setup must not silently mix with an ACTIVE external MCP
+  // configuration: the guard runs before ensureAuthenticated, so no browser
+  // is opened, no shared credentials are refreshed, and no runtime/config is
+  // touched. `setup --external-mcp` (options.externalMcp === true) is the
+  // explicit refresh path and bypasses this guard.
+  if (options.externalMcp !== true) {
+    await assertNoActiveExternalMcp([options.harness], 'setup', logger)
+  }
+
+  // Experimental `--external-mcp` preflight: reject unsupported harnesses and
+  // old-plugin coexistence conflicts BEFORE any side effects — no OAuth round
+  // trip, no config writes, no runtime changes.
+  if (options.externalMcp === true) {
+    assertExternalMcpSetupPreflight([options.harness])
+  }
 
   let bundle: BundleDescriptor
   try {
@@ -179,6 +260,32 @@ export async function setup (options: SetupOptions): Promise<SetupResult> {
       result.errors.push(`Authentication failed: ${pluginErr.message}`)
       return result
     }
+  }
+
+  // Experimental `--external-mcp` mode (skills-only community experiment):
+  // credentials are now valid (or the bundle needs no auth). Write direct HTTP
+  // MCP config through the existing install() path with packageOwnedSkills:
+  // true — no skill copies/links — and skip ensureMcpRemoteRuntime entirely:
+  // the shared mcp-remote runtime is never inspected, installed, repaired, or
+  // deleted here; a runtime provisioned for another integration stays
+  // untouched, and its absence does not block this mode. The default setup
+  // flow below is unchanged.
+  if (options.externalMcp === true) {
+    const installResult = await install({
+      ...options,
+      packageOwnedSkills: true,
+      progress,
+    })
+    result.skillsInstalled = installResult.skillsInstalled
+    result.mcpServersConfigured = installResult.mcpServersConfigured
+    result.errors.push(...installResult.errors)
+    result.success = installResult.success
+    logger.info('setup.externalMcp.finish', {
+      harness: options.harness,
+      success: result.success,
+      mcpServers: result.mcpServersConfigured.length,
+    })
+    return result
   }
 
   // Provision the shared MCP bridge runtime (mcp-remote) for every harness:
@@ -241,6 +348,18 @@ export async function install (options: InstallOptions): Promise<InstallResult> 
   }
 
   logger.info('install.start', { harness: options.harness, bundlePath: options.bundlePath, skillsSource: options.skillsSource })
+
+  // Same corrupt-tracking preflight as setup(): reject before any skill copy,
+  // config write, runtime or tracking mutation.
+  await assertTrackingFileReadable(logger)
+
+  // Same mode-mixing guard as setup(): a flagless install for an ACTIVE
+  // external harness must reject before any skill copy, config write, or
+  // tracking mutation. The internal flagged install from setup --external-mcp
+  // (options.externalMcp === true) bypasses it.
+  if (options.externalMcp !== true) {
+    await assertNoActiveExternalMcp([options.harness], 'install', logger)
+  }
 
   let bundle: BundleDescriptor
   try {
@@ -376,6 +495,19 @@ export async function install (options: InstallOptions): Promise<InstallResult> 
     if (mcpConfigPath && result.mcpServersConfigured.length > 0) {
       const mcpEntries = bundle.mcpServers.map((s) => ({ name: s.name, configPath: mcpConfigPath }))
       await addTrackedMcps(mcpEntries, options.harness, logger)
+      if (options.externalMcp === true) {
+        // Ownership evidence is mandatory in external mode: without it a
+        // later disconnect cannot tell the entry apart from a user copy, and
+        // a failure here must not report a safely managed install.
+        await recordExternalMcpOwnership(options.harness, mcpEntries, logger)
+      } else {
+        // A successful flagless (legacy) install re-created these entries and
+        // supersedes a disconnected external-MCP tombstone for this harness:
+        // keeping it would refuse the next uninstall with "present again"
+        // and leave no CLI path out. Active records never reach this point
+        // (the flagless guard above already rejected them).
+        await clearDisconnectedExternalMcp(options.harness, logger)
+      }
     }
   } catch (err) {
     const pluginErr = toPluginError(err, 'TRACKING_UPDATE_FAILED', { harness: options.harness })
@@ -406,6 +538,14 @@ export async function install (options: InstallOptions): Promise<InstallResult> 
  */
 export async function installWithRuntime (options: InstallOptions): Promise<InstallResult> {
   const logger = options.logger ?? createLogger({ verbose: isVerboseEnabled(options.verbose) })
+  // Reject a corrupt tracking file before the runtime precondition can
+  // create/download anything.
+  await assertTrackingFileReadable(logger)
+  // Reject before the runtime precondition can create/download anything: a
+  // flagless dispatcher run must not mix with an ACTIVE external harness.
+  if (options.externalMcp !== true) {
+    await assertNoActiveExternalMcp([options.harness], 'install', logger)
+  }
   try {
     await ensureMcpRemoteRuntime()
   } catch (err) {
@@ -438,206 +578,41 @@ export async function logout (): Promise<LogoutResult> {
   return { removed, path }
 }
 
-export interface UninstallOptions {
-  bundlePath?: string
-  verbose?: boolean
-  logger?: Logger
-  keepCredentials?: boolean
-}
-
-export interface UninstallResult {
-  errors: string[]
-  credentialsPurged?: boolean
-}
-
-export async function uninstall (
-  harness: HarnessType,
-  options?: UninstallOptions
-): Promise<UninstallResult> {
-  const logger = options?.logger ?? createLogger({ verbose: isVerboseEnabled(options?.verbose) })
-  const errors: string[] = []
-  const adapter = getAdapter(harness)
-  const tracking = await readTrackingFile(logger)
-
-  logger.info('uninstall.start', { harness })
-
-  if (tracking) {
-    const harnessSkills = tracking.skills.filter((s) => s.harnesses.includes(harness))
-    const harnessMcps = tracking.mcpServers.filter((m) => m.harness === harness)
-
-    if (harnessMcps.length > 0) {
-      const mcpConfigPath = adapter.getMcpConfigPath()
-      try {
-        await removeMcpConfig(harness, harnessMcps.map((m) => m.name), {
-          configPath: mcpConfigPath ?? undefined,
-          logger,
-        })
-        await removeTrackedMcps(harnessMcps.map((m) => m.name), harness, logger)
-        logger.info('uninstall.mcp.done', { harness, count: harnessMcps.length })
-      } catch (err) {
-        const pluginErr = toPluginError(err, 'MCP_CONFIG_WRITE_FAILED', { harness, path: mcpConfigPath ?? undefined })
-        errors.push(`MCP removal failed: ${pluginErr.message}`)
-      }
-    }
-
-    if (harnessSkills.length > 0) {
-      const skillRefs = harnessSkills.map((s) => ({
-        name: s.name,
-        path: s.path,
-        description: '',
-      }))
-      const orphaned = harnessSkills
-        .filter((s) => s.harnesses.length === 1)
-        .map((s) => ({ name: s.name, path: s.path, description: '' }))
-      try {
-        await unlinkSkillsFromHarness(harness, skillRefs, logger)
-        await removeTrackedSkills(skillRefs, harness, logger)
-        if (orphaned.length > 0) {
-          await uninstallSkills(orphaned, logger)
-        }
-        logger.info('uninstall.skills.done', { harness, count: harnessSkills.length })
-      } catch (err) {
-        const pluginErr = toPluginError(err, 'SKILL_LINK_FAILED', { harness })
-        errors.push(`Skill removal failed: ${pluginErr.message}`)
-      }
-    }
-
-    // Remove the harness's native plugin (e.g. `claude plugin install`,
-    // `agy plugin install`) when present. This is distinct from the CLI-tracked
-    // skills/MCP above: native installs are owned by the harness CLI and would
-    // otherwise survive `uninstall`. Best-effort and non-fatal.
-    if (adapter.detectNativePlugin) {
-      try {
-        const nativeResult = await removeNativePlugin(harness, adapter, { logger })
-        errors.push(...nativeResult.warnings)
-      } catch (err) {
-        errors.push(`Native plugin removal failed: ${(err as Error).message}`)
-      }
-    }
-
-    // After all per-harness removal, see whether ANY install remains across any harness.
-    // removeTrackedSkills/removeTrackedMcps already unlink the tracking file when it empties,
-    // so a null read == "nothing NodeSource-installed is left anywhere".
-    let credentialsPurged = false
-    if (!options?.keepCredentials) {
-      const remaining = await readTrackingFile(logger)
-      const isEmpty = !remaining || (remaining.skills.length === 0 && remaining.mcpServers.length === 0)
-      if (isEmpty) {
-        try {
-          if (removeCredentials()) {
-            credentialsPurged = true
-            logger.info('uninstall.credentials.purged', { reason: 'last-harness' })
-          }
-        } catch (err) {
-          // Non-fatal: uninstall still "succeeded" for this harness; surface as a warning.
-          errors.push(`Could not remove credentials: ${(err as Error).message}`)
-        }
-      }
-    }
-
-    logger.info('uninstall.finish', { harness, errors: errors.length, credentialsPurged })
-    return { errors, credentialsPurged }
-  } else {
-    const warnings = await bestEffortCleanup(harness, adapter, options, logger)
-    errors.push(...warnings)
-
-    // Even without a tracking file, a native plugin may still be staged by the
-    // harness CLI; remove it best-effort so `uninstall` is consistent.
-    if (adapter.detectNativePlugin) {
-      try {
-        const nativeResult = await removeNativePlugin(harness, adapter, { logger })
-        errors.push(...nativeResult.warnings)
-      } catch (err) {
-        errors.push(`Native plugin removal failed: ${(err as Error).message}`)
-      }
-    }
-
-    // Best-effort cleanup intentionally never purges credentials: without a
-    // tracking file we cannot reliably tell whether another harness is still
-    // installed. Users can run `nsolid-plugin logout` to remove credentials.
-    logger.info('uninstall.finish', { harness, errors: errors.length, bestEffort: true })
-    return { errors }
-  }
-}
-
-async function bestEffortCleanup (
-  harness: HarnessType,
-  adapter: HarnessAdapter,
-  options?: { bundlePath?: string },
-  logger?: Logger
-): Promise<string[]> {
-  const warnings: string[] = []
-  const skillsDir = harness === 'opencode' ? adapter.getSkillsPath() : getSkillsDir()
-  try {
-    const entries = await readdir(skillsDir, { withFileTypes: true })
-    const nsSkills = entries
-      .filter((e) => e.isDirectory() && e.name.startsWith('ns-'))
-      .map((e) => ({
-        name: e.name,
-        path: path.join(skillsDir, e.name),
-        description: '',
-      }))
-
-    if (nsSkills.length > 0) {
-      logger?.info('uninstall.bestEffort.skills', { harness, count: nsSkills.length })
-      await unlinkSkillsFromHarness(harness, nsSkills, logger)
-      if (harness !== 'opencode') {
-        await uninstallSkills(nsSkills, logger)
-      }
-    }
-  } catch {
-    // Skills directory doesn't exist or is unreadable — nothing to clean
-  }
-
-  if (adapter.supportsMcp()) {
-    let mcpNames = KNOWN_MCP_SERVERS
-    let usedBundle = false
-    if (options?.bundlePath) {
-      try {
-        const bundleData = readJsonFile<BundleDescriptor>(options.bundlePath)
-        if (bundleData?.mcpServers) {
-          mcpNames = bundleData.mcpServers.map((s) => s.name)
-          usedBundle = true
-        }
-      } catch {
-        // Fall back to hardcoded list
-      }
-    }
-    if (!usedBundle) {
-      // For plugin-owned harnesses (claude/codex/antigravity) the MCP servers
-      // are owned by the native plugin, not the harness-level MCP config.
-      // removeNativePlugin() handles the real cleanup, so the hardcoded
-      // fallback here is redundant and the warning would only be noise.
-      if (!PLUGIN_OWNED_HARNESSES.has(harness)) {
-        warnings.push(
-          'No tracking file and no bundle provided — using hardcoded MCP server list; user-added MCP servers may be left in the config'
-        )
-      }
-    }
-    try {
-      const mcpConfigPath = adapter.getMcpConfigPath()
-      await removeMcpConfig(harness, mcpNames, {
-        configPath: mcpConfigPath ?? undefined,
-        logger,
-      })
-      logger?.info('uninstall.bestEffort.mcp', { harness, servers: mcpNames })
-    } catch {
-      // Best-effort
-    }
-  }
-
-  return warnings
-}
+export type { UninstallOptions, UninstallResult, UninstallStageResult, UninstallStageName, UninstallStageStatus, UninstallBatchResult } from './uninstall.js'
 
 export async function restore (
   harness: HarnessType,
   options?: { backupPath?: string; verbose?: boolean; logger?: Logger }
 ): Promise<BackupEntry> {
   const logger = options?.logger ?? createLogger({ verbose: isVerboseEnabled(options?.verbose) })
+  // Reject a corrupt tracking file before the backup restore writes anything.
+  await assertTrackingFileReadable(logger)
+  // Restoring a whole-file backup while an ACTIVE external record exists can
+  // resurrect stale direct entries and desynchronize mode/config state, so it
+  // is rejected before the file write. `restore --list` stays read-only and
+  // does not reach this function.
+  await assertNoActiveExternalMcp([harness], 'restore', logger)
   logger.info('restore.start', { harness, backupPath: options?.backupPath })
   const entry = restoreConfigBackup(harness, options?.backupPath)
   logger.info('restore.done', { harness, originalPath: (await entry).originalPath })
   return entry
+}
+
+function unverifiedExternalMcpReport (
+  configured: string[],
+  configError?: string
+): NonNullable<DoctorReport['externalMcp']> {
+  return {
+    status: 'unverified',
+    reason: 'External MCP mode: direct HTTP config is present, but doctor does not probe endpoint reachability or authentication and does not verify external package skills.',
+    configured,
+    checks: {
+      authentication: 'unverified',
+      skills: 'unverified',
+      remoteReachability: 'unverified',
+    },
+    ...(configError !== undefined ? { configError } : {}),
+  }
 }
 
 export async function doctor (
@@ -684,15 +659,28 @@ export async function doctor (
 
   const adapter = getAdapter(harness)
 
+  // External-MCP ownership is additive per-harness state in the shared
+  // tracking file. An ACTIVE record means the direct HTTP config is owned by
+  // the experimental mode, and doctor can only report that install as
+  // unverified: local config presence is not reachability or authentication,
+  // and skills are provided by the external package rather than tracked here.
+  const tracking = await readTrackingFile(logger)
+  const externalActive = tracking?.externalMcp?.[harness]?.state === 'active'
+
   // For plugin/package-owned harnesses the recommended install path is the
   // harness's native mechanism, not the CLI tracking file. Probe it here; when
   // present, skills and MCP servers are owned by the plugin and reported as ok.
   const isNativeHarness = NATIVE_PLUGIN_HARNESSES.has(harness)
   let nativeOwned = false
+  // Only the LEGACY plugin registers MCP servers; the skills-only plugin owns
+  // skills alone, so it must not imply bridge/MCP ownership (identity-role
+  // regression: the broad uninstall identity must not leak into doctor).
+  let nativeLegacyOwned = false
   if (isNativeHarness && adapter.detectNativePlugin) {
     const detected = adapter.detectNativePlugin()
     if (detected.installed) {
       nativeOwned = detected.enabled !== false
+      nativeLegacyOwned = nativeOwned && legacyNsolidPluginIds(detected).length > 0
       report.plugin = {
         status: 'ok',
         installed: true,
@@ -711,7 +699,7 @@ export async function doctor (
   // informational: a ready proxy says nothing about remote endpoint health,
   // and a missing one does not break those configurations.
   const bridge = inspectMcpRemoteRuntime()
-  const bridgeRequired = nativeOwned && PLUGIN_OWNED_HARNESSES.has(harness)
+  const bridgeRequired = nativeLegacyOwned && PLUGIN_OWNED_HARNESSES.has(harness)
   report.bridge = {
     status: bridge.status,
     version: bridge.version,
@@ -729,21 +717,81 @@ export async function doctor (
   if (!bundle) {
     report.skills.status = 'unknown'
     report.mcpServers.status = 'unknown'
+    if (externalActive) {
+      report.externalMcp = unverifiedExternalMcpReport([])
+    }
+  } else if (externalActive) {
+    // Never populate `reachable` from config presence: these entries are
+    // configured locally, not connection-tested. Structural config errors are
+    // reported separately through `configError` + `errors` so they stay
+    // distinguishable from the merely-unverified state.
+    let configured: string[] = []
+    let configError: string | undefined
+    if (adapter.supportsMcp()) {
+      try {
+        const onDiskConfig = await adapter.readMcpConfig()
+        const onDiskNames = new Set(Object.keys(onDiskConfig.mcpServers))
+        configured = bundle.mcpServers.map((s) => s.name).filter((name) => onDiskNames.has(name))
+      } catch (err) {
+        configError = (err as Error).message
+      }
+    }
+    report.skills.status = 'unverified'
+    report.mcpServers.status = 'unverified'
+    report.externalMcp = unverifiedExternalMcpReport(configured, configError)
+    if (configError) {
+      report.errors.push(`MCP config could not be read for ${harness}: ${configError}`)
+    }
   } else if (nativeOwned) {
-    // The native plugin owns skills and MCP config; report them as satisfied
-    // rather than cross-referencing the (irrelevant) CLI tracking file.
+    // The native plugin owns skills; the LEGACY plugin also owns the MCP
+    // config and bridge. The skills-only plugin provides no MCP servers, so
+    // MCP ownership must not be claimed on its behalf.
     report.skills.installed = bundle.skills.map((s) => s.name)
     report.skills.missing = []
     report.skills.status = 'ok'
-    if (adapter.supportsMcp()) {
+    if (adapter.supportsMcp() && nativeLegacyOwned) {
       report.mcpServers.reachable = bundle.mcpServers.map((s) => s.name)
       report.mcpServers.unreachable = []
       report.mcpServers.status = 'ok'
+    } else if (adapter.supportsMcp() && !nativeLegacyOwned && bundle.mcpServers.length > 0) {
+      // Skills-only native plugin: it registers no MCP servers itself, so the
+      // harness's direct MCP config decides whether the bundle servers are
+      // actually configured. Never keep the success default for a dimension
+      // that was not inspected.
+      let onDiskNames: Set<string> | null = null
+      try {
+        const onDiskConfig = await adapter.readMcpConfig()
+        onDiskNames = new Set(Object.keys(onDiskConfig.mcpServers))
+      } catch (err) {
+        const configError = (err as Error).message
+        report.mcpServers.status = 'unreachable'
+        report.errors.push(`MCP config could not be read for ${harness}: ${configError}`)
+      }
+      if (onDiskNames !== null) {
+        const configured = bundle.mcpServers.map((s) => s.name).filter((name) => onDiskNames.has(name))
+        report.mcpServers.reachable = configured
+        report.mcpServers.unreachable = bundle.mcpServers.map((s) => s.name).filter((name) => !onDiskNames.has(name))
+        if (configured.length === 0) {
+          // With ZERO bundle servers configured the remedy is actionable, not
+          // merely unverified. The command must be valid for the harness: the
+          // external-mcp mode exists only for EXTERNAL_MCP_HARNESSES, so any
+          // other harness is pointed at the flagless setup flow instead.
+          report.mcpServers.status = 'unreachable'
+          const remedy = EXTERNAL_MCP_HARNESSES.has(harness)
+            ? `nsolid-plugin setup --harness ${harness} --external-mcp`
+            : `nsolid-plugin setup --harness ${harness}`
+          report.errors.push(`No bundle MCP servers are configured for ${harness}. Run: ${remedy}`)
+        } else {
+          // Mirror the externalActive branch: config presence is not a
+          // connection test, so configured entries stay unverified.
+          report.mcpServers.status = 'unverified'
+        }
+      }
     }
   } else {
     const expectedMcps = bundle.mcpServers.map((s) => s.name)
 
-    const trackedSkills = await readTrackingFile(logger)
+    const trackedSkills = tracking
     const trackedSkillEntries = trackedSkills?.skills.filter((s) => s.harnesses.includes(harness)) ?? []
     const trackedByName = new Map(trackedSkillEntries.map((s) => [s.name, s]))
     const skillsDirForHarness = harness === 'opencode' ? adapter.getSkillsPath() : getSkillsDir()
@@ -818,11 +866,20 @@ export async function doctor (
     (report.bridge?.required !== true || report.bridge.status === 'ready') &&
     report.errors.length === 0
 
+  // D1: an ACTIVE external MCP install can never be certified healthy without
+  // live verification — local config presence says nothing about the endpoint
+  // or the stored token. The report renders the scope as unverified (not
+  // broken/missing) and the CLI still exits nonzero.
+  if (externalActive) report.healthy = false
+
   logger.info('doctor.finish', { healthy: report.healthy })
   return report
 }
 
 export type { HarnessType, InstallOptions, InstallResult, SetupOptions, SetupResult, DoctorReport, BundleDescriptor, Credentials, BrowserLauncher } from './types.js'
 export type { LinkResult, LinkStatus } from './skills/skill-linker.js'
-export type { SkillTrackingEntry, McpTrackingEntry, TrackingData } from './skills/skill-tracker.js'
+export type { SkillTrackingEntry, McpTrackingEntry, TrackingData, ExternalMcpConnectionState, ExternalMcpEntryRecord, ExternalMcpHarnessRecord, PendingMarketplaceRemoval } from './skills/skill-tracker.js'
 export type { BackupEntry } from './utils/backup.js'
+export { disconnectExternalMcp, assertNoActiveExternalMcp } from './mcp/index.js'
+export type { DisconnectExternalMcpResult, DisconnectExternalMcpOptions } from './mcp/index.js'
+export { uninstall, uninstallHarnesses, preflightUninstall } from './uninstall.js'

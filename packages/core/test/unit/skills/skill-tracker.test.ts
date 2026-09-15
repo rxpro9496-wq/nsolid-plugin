@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
 import { join, isAbsolute } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { SkillRef } from '../../../src/types.js'
@@ -218,5 +218,114 @@ describe('listTrackedSkills', () => {
     const listed = await listTrackedSkills()
     assert.strictEqual(listed.length, 2)
     assert.deepStrictEqual(listed.map((s) => s.name), ['ns-analyze-cpu', 'ns-analyze-memory'])
+  })
+})
+
+describe('readTrackingFileStrict: pending marketplace removal validation', () => {
+  const recordedAt = '2026-01-01T00:00:00.000Z'
+  const base = { version: '1.0.0', installedAt: recordedAt, harness: 'claude', skills: [], mcpServers: [] }
+
+  function writeTracking (value: unknown): void {
+    mkdirSync(join(tmpDir, '.agents'), { recursive: true })
+    writeFileSync(join(tmpDir, '.agents/.nodesource-installed.json'), JSON.stringify(value))
+  }
+
+  /** Every shape here must be refused: a malformed pending record can authorize an unrelated cleanup. */
+  const malformed: Array<[string, Record<string, unknown>]> = [
+    ['a non-object field with no externalMcp state', { pendingMarketplaceRemovals: 'corrupt' }],
+    ['a null field', { pendingMarketplaceRemovals: null }],
+    ['an array field', { pendingMarketplaceRemovals: [] }],
+    ['an unknown harness key', { pendingMarketplaceRemovals: { 'not-a-harness': [] } }],
+    ['a non-array harness record', { pendingMarketplaceRemovals: { claude: 'nodesource' } }],
+    ['a non-object entry', { pendingMarketplaceRemovals: { claude: [42] } }],
+    ['an unrelated marketplace name', { pendingMarketplaceRemovals: { claude: [{ name: 'unrelated-marketplace', scope: 'bogus', reason: 'retry' }] } }],
+    ['a plugin base name used as a marketplace name', { pendingMarketplaceRemovals: { claude: [{ name: 'nsolid-skills-plugin', scope: 'user', reason: 'r', recordedAt }] } }],
+    ['an invalid explicit scope', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'bogus', reason: 'r', recordedAt }] } }],
+    ['a non-string scope', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 7, reason: 'r', recordedAt }] } }],
+    ['a missing Claude scope', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', reason: 'r', recordedAt }] } }],
+    ['a scope on a non-Claude harness', { pendingMarketplaceRemovals: { codex: [{ name: 'nodesource', scope: 'user', reason: 'r', recordedAt }] } }],
+    ['a missing reason', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'user', recordedAt }] } }],
+    ['a non-string recordedAt', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'user', reason: 'r', recordedAt: 7 }] } }],
+    ['a project-scope entry with no settings path', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'project', reason: 'r', recordedAt }] } }],
+    ['a local-scope entry with no settings path', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'local', reason: 'r', recordedAt }] } }],
+    ['a null settings path', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'project', settingsPath: null, reason: 'r', recordedAt }] } }],
+    ['a non-string settings path', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'project', settingsPath: 7, reason: 'r', recordedAt }] } }],
+    ['a relative project settings path', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'project', settingsPath: '.claude/settings.json', reason: 'r', recordedAt }] } }],
+    ['a relative local settings path', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'local', settingsPath: '.claude/settings.local.json', reason: 'r', recordedAt }] } }],
+    ['a settings path on a user-scope entry', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'user', settingsPath: '/tmp/p/.claude/settings.json', reason: 'r', recordedAt }] } }],
+    ['a settings path on a non-Claude harness', { pendingMarketplaceRemovals: { codex: [{ name: 'nodesource', settingsPath: '/tmp/p/.claude/settings.json', reason: 'r', recordedAt }] } }],
+    ['a project settings path with a trailing separator', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'project', settingsPath: '/tmp/p/.claude/settings.json/', reason: 'r', recordedAt }] } }],
+    ['a local settings path with a dot segment', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'local', settingsPath: '/tmp/p/.claude/./settings.local.json', reason: 'r', recordedAt }] } }],
+    ['a project settings path with a parent segment', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'project', settingsPath: '/tmp/p/x/../.claude/settings.json', reason: 'r', recordedAt }] } }],
+    ['a project settings path with redundant separators', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'project', settingsPath: '/tmp//p/.claude/settings.json', reason: 'r', recordedAt }] } }],
+    ['a local settings path with a NUL byte', { pendingMarketplaceRemovals: { claude: [{ name: 'nodesource', scope: 'local', settingsPath: '/tmp/p/.claude/settings.local.json\u0000', reason: 'r', recordedAt }] } }],
+  ]
+
+  for (const [label, pending] of malformed) {
+    it(`rejects ${label}`, async () => {
+      const { readTrackingFileStrict } = await import('../../../src/skills/skill-tracker.js')
+      writeTracking({ ...base, externalMcp: {}, ...pending })
+      await assert.rejects(
+        () => readTrackingFileStrict(),
+        (err: any) => {
+          assert.strictEqual(err.code, 'TRACKING_CORRUPT', label)
+          assert.match(err.message, /pendingMarketplaceRemovals/, label)
+          return true
+        }
+      )
+    })
+  }
+
+  it('rejects a malformed pending map even when externalMcp is absent', async () => {
+    const { readTrackingFileStrict } = await import('../../../src/skills/skill-tracker.js')
+    writeTracking({ ...base, pendingMarketplaceRemovals: 'corrupt' })
+    await assert.rejects(
+      () => readTrackingFileStrict(),
+      (err: any) => {
+        assert.strictEqual(err.code, 'TRACKING_CORRUPT')
+        assert.match(err.message, /pendingMarketplaceRemovals/)
+        return true
+      }
+    )
+  })
+
+  it('accepts the canonical and legacy-experimental pending identities', async () => {
+    const { readTrackingFileStrict } = await import('../../../src/skills/skill-tracker.js')
+    writeTracking({
+      ...base,
+      pendingMarketplaceRemovals: {
+        claude: [{ name: 'nodesource', scope: 'user', reason: 'r', recordedAt }],
+        codex: [{ name: 'nodesource', reason: 'r', recordedAt }],
+        antigravity: [{ name: 'nsolid-skills', reason: 'r', recordedAt }],
+      },
+    })
+    const tracking = await readTrackingFileStrict()
+    assert.strictEqual(tracking?.pendingMarketplaceRemovals?.claude?.length, 1)
+  })
+
+  it('accepts project and local identities that carry an absolute settings path', async () => {
+    const { readTrackingFileStrict } = await import('../../../src/skills/skill-tracker.js')
+    const settingsPath = join(tmpDir, 'project-a/.claude/settings.json')
+    const localSettingsPath = join(tmpDir, 'project-a/.claude/settings.local.json')
+    writeTracking({
+      ...base,
+      pendingMarketplaceRemovals: {
+        claude: [
+          { name: 'nodesource', scope: 'project', settingsPath, reason: 'r', recordedAt },
+          { name: 'nsolid-skills', scope: 'local', settingsPath: localSettingsPath, reason: 'r', recordedAt },
+        ],
+      },
+    })
+    const tracking = await readTrackingFileStrict()
+    assert.deepStrictEqual(
+      tracking?.pendingMarketplaceRemovals?.claude?.map((record) => [record.scope, record.settingsPath]),
+      [['project', settingsPath], ['local', localSettingsPath]]
+    )
+  })
+
+  it('still accepts a legacy file with no pending and no external state', async () => {
+    const { readTrackingFileStrict } = await import('../../../src/skills/skill-tracker.js')
+    writeTracking(base)
+    assert.deepStrictEqual((await readTrackingFileStrict())?.skills, [])
   })
 })
