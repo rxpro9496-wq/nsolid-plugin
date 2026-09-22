@@ -7,5 +7,6 @@ export default async function nodesourcePiPlugin () {
     name: 'nsolid-pi-plugin',
     skills: 'package-owned',
     setup: 'nsolid-plugin setup --harness pi',
+    rrun
   }
 }
